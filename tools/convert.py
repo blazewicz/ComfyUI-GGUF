@@ -155,8 +155,49 @@ class ModelIdeogram(ModelTemplate):
         )
     ]
 
-arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2, 
-             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2, ModelIdeogram]
+class ModelKrea2(ModelTemplate):
+    """
+    Krea-2 is a novel architecture from krea.ai — NOT Ideogram4.
+    Key structure (verified from Krea2_Turbo_fp8mixed.safetensors header):
+      blocks.N.attn.{wq,wk,wv,wo,gate}  — separate Q/K/V/O projections + gating
+      blocks.N.attn.qknorm.{qnorm,knorm} — Q/K norms
+      blocks.N.mlp.{up,gate,down}        — SwiGLU-style MLP
+      blocks.N.mod.lin                   — per-block modulation
+      blocks.N.{pre,post}norm.scale      — RMSNorm scales
+      txtfusion.layerwise_blocks.N.*     — layerwise text-image cross-attention
+      txtfusion.refiner_blocks.N.*       — refiner text-image cross-attention
+      txtfusion.projector                — text projector
+      first.weight / last.*              — input / output projections
+      tmlp.N / tproj.N                   — timestep MLP / projection
+
+    NOTE: ComfyUI core must have krea2 diffusion model support
+    (i.e. a detection branch for 'blocks.0.attn.wq.weight' in model_detection.py
+    and a matching supported_models entry) for the GGUF to load correctly.
+    Krea-2 was released 2026-06-22; verify your ComfyUI build is up to date.
+    """
+    arch = "krea2"
+    keys_detect = [
+        (
+            "blocks.0.attn.wq.weight",
+            "txtfusion.projector.weight",
+            "first.weight",
+        ),
+        (
+            "blocks.0.attn.wq.weight",
+            "txtfusion.layerwise_blocks.0.attn.wq.weight",
+            "last.linear.weight",
+        ),
+    ]
+    keys_hiprec = [
+        "blocks.0.mod.lin",  # modulation parameters — keep at full precision
+        "last.modulation.lin",
+        "tmlp.",
+        "tproj.",
+    ]
+
+arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
+             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
+             ModelKrea2, ModelIdeogram]
 
 def is_model_arch(model, state_dict):
     # check if model is correct
@@ -179,10 +220,30 @@ def detect_arch(state_dict):
     assert model_arch is not None, "Unknown model architecture!"
     return model_arch
 
+QUANT_TYPE_MAP = {
+    "F16":  (gguf.GGMLQuantizationType.F16,  gguf.LlamaFileType.MOSTLY_F16),
+    "BF16": (gguf.GGMLQuantizationType.BF16, gguf.LlamaFileType.MOSTLY_BF16),
+    "Q8_0": (gguf.GGMLQuantizationType.Q8_0, gguf.LlamaFileType.MOSTLY_Q8_0),
+    "Q5_1": (gguf.GGMLQuantizationType.Q5_1, gguf.LlamaFileType.MOSTLY_Q5_1),
+    "Q5_0": (gguf.GGMLQuantizationType.Q5_0, gguf.LlamaFileType.MOSTLY_Q5_0),
+    "Q4_1": (gguf.GGMLQuantizationType.Q4_1, gguf.LlamaFileType.MOSTLY_Q4_1),
+    "Q4_0": (gguf.GGMLQuantizationType.Q4_0, gguf.LlamaFileType.MOSTLY_Q4_0),
+}
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate F16 GGUF files from single UNET")
-    parser.add_argument("--src", required=True, help="Source model ckpt file.")
-    parser.add_argument("--dst", help="Output unet gguf file.")
+    parser = argparse.ArgumentParser(
+        description="Convert diffusion model safetensors/ckpt to GGUF."
+        " By default produces an F16/BF16 GGUF; use --quant-type to quantize."
+    )
+    parser.add_argument("--src", required=True, help="Source model ckpt/safetensors file.")
+    parser.add_argument("--dst", help="Output GGUF file path.")
+    parser.add_argument(
+        "--quant-type",
+        choices=list(QUANT_TYPE_MAP.keys()),
+        default=None,
+        help="Target quantization type for eligible 2-D+ tensors "
+             "(1-D biases/scales stay F32). Defaults to F16/BF16 matching the source dtype.",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.src):
@@ -234,7 +295,7 @@ def load_state_dict(path):
 
     return strip_prefix(state_dict)
 
-def handle_tensors(writer, state_dict, model_arch):
+def handle_tensors(writer, state_dict, model_arch, quant_type=None):
     name_lengths = tuple(sorted(
         ((key, len(key)) for key in state_dict.keys()),
         key=lambda item: item[1],
@@ -257,7 +318,7 @@ def handle_tensors(writer, state_dict, model_arch):
             data = data.to(torch.float32).numpy()
         # this is so we don't break torch 2.0.X
         elif data.dtype in [getattr(torch, "float8_e4m3fn", "_invalid"), getattr(torch, "float8_e5m2", "_invalid")]:
-            data = data.to(torch.float16).numpy()
+            data = data.to(torch.float32).numpy()  # cast to f32 for correct downstream quant
         else:
             data = data.numpy()
 
@@ -294,6 +355,10 @@ def handle_tensors(writer, state_dict, model_arch):
                 # tensors that require max precision
                 data_qtype = gguf.GGMLQuantizationType.F32
 
+            elif quant_type is not None:
+                # caller-specified quantization type for all eligible tensors
+                data_qtype = quant_type
+
         if (model_arch.shape_fix                        # NEVER reshape for models such as flux
             and n_dims > 1                              # Skip one-dimensional tensors
             and n_params >= REARRANGE_THRESHOLD         # Only rearrange tensors meeting the size requirement
@@ -318,26 +383,32 @@ def handle_tensors(writer, state_dict, model_arch):
 
         writer.add_tensor(new_name, data, raw_dtype=data_qtype)
 
-def convert_file(path, dst_path=None, interact=True, overwrite=False):
+def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type_name=None):
     # load & run model detection logic
     state_dict = load_state_dict(path)
     model_arch = detect_arch(state_dict)
     logging.info(f"* Architecture detected from input: {model_arch.arch}")
 
-    # detect & set dtype for output file
-    dtypes = [x.dtype for x in state_dict.values()]
-    dtypes = {x:dtypes.count(x) for x in set(dtypes)}
-    main_dtype = max(dtypes, key=dtypes.get)
-
-    if main_dtype == torch.bfloat16:
-        ftype_name = "BF16"
-        ftype_gguf = gguf.LlamaFileType.MOSTLY_BF16
-    # elif main_dtype == torch.float32:
-    #     ftype_name = "F32"
-    #     ftype_gguf = None
+    # resolve quant type from name if provided
+    quant_type = None
+    if quant_type_name is not None and quant_type_name in QUANT_TYPE_MAP:
+        quant_type, ftype_gguf = QUANT_TYPE_MAP[quant_type_name]
+        ftype_name = quant_type_name
     else:
-        ftype_name = "F16"
-        ftype_gguf = gguf.LlamaFileType.MOSTLY_F16
+        # detect & set dtype from source file
+        dtypes = [x.dtype for x in state_dict.values()]
+        dtypes = {x: dtypes.count(x) for x in set(dtypes)}
+        main_dtype = max(dtypes, key=dtypes.get)
+
+        if main_dtype == torch.bfloat16:
+            ftype_name = "BF16"
+            ftype_gguf = gguf.LlamaFileType.MOSTLY_BF16
+        # elif main_dtype == torch.float32:
+        #     ftype_name = "F32"
+        #     ftype_gguf = None
+        else:
+            ftype_name = "F16"
+            ftype_gguf = gguf.LlamaFileType.MOSTLY_F16
 
     if dst_path is None:
         dst_path = f"{os.path.splitext(path)[0]}-{ftype_name}.gguf"
@@ -356,7 +427,7 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False):
     if ftype_gguf is not None:
         writer.add_file_type(ftype_gguf)
 
-    handle_tensors(writer, state_dict, model_arch)
+    handle_tensors(writer, state_dict, model_arch, quant_type=quant_type)
     writer.write_header_to_file(path=dst_path)
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
@@ -371,4 +442,4 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False):
 
 if __name__ == "__main__":
     args = parse_args()
-    convert_file(args.src, args.dst)
+    convert_file(args.src, args.dst, quant_type_name=args.quant_type)
