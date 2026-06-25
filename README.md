@@ -47,7 +47,7 @@ Pre-quantized models (🍴 icon on ones added by this fork):
 - [stable-diffusion-3.5-large GGUF](https://huggingface.co/city96/stable-diffusion-3.5-large-gguf)
 - [stable-diffusion-3.5-large-turbo GGUF](https://huggingface.co/city96/stable-diffusion-3.5-large-turbo-gguf)
 - [Krea 2 (Both Turbo and Raw)](https://huggingface.co/molbal/krea2-gguf) 🍴
-- [Ideogram 4](https://huggingface.co/molbal/ideogram-4-gguff) 🍴
+- [Ideogram 4](https://huggingface.co/molbal/ideogram-4-gguf) 🍴
 
 
 > [!IMPORTANT]  
