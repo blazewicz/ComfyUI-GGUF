@@ -518,6 +518,23 @@ def gguf_clip_loader(path):
         if arch == "qwen2vl":
             vsd = gguf_mmproj_loader(path)
             sd.update(vsd)
+        if arch == "qwen3vl" and "model.visual.deepstack_merger_list.0.norm.weight" not in sd:
+            # Standard llama.cpp Qwen3-VL GGUFs omit the visual tower. Without it,
+            # detect_te_model() mis-classifies the state dict as QWEN3_4B/8B (Qwen3 LM)
+            # instead of QWEN3VL_4B/8B, so clip_type=KREA2 never selects the 12-layer
+            # tap encoder and conditioning has shape (B, seq, 2560) instead of (B, seq, 30720).
+            # Inject zero sentinel tensors with shapes that exactly match the model
+            # parameters so that load_state_dict(strict=False) doesn't raise a size
+            # mismatch error while still satisfying detect_te_model()'s key checks.
+            #   deepstack_merger_list.0.norm  -> LayerNorm(vis_hidden * 4)  shape [merge_dim]
+            #   merger.linear_fc2             -> Linear(merge_dim, lm_hidden) shape [lm_hidden, merge_dim]
+            ln_key = "model.layers.0.input_layernorm.weight"
+            lm_hidden = int(sd[ln_key].shape[0]) if ln_key in sd else 2560
+            vis_hidden = 1024 if lm_hidden == 2560 else 1152  # Qwen3-VL-4B vs 8B
+            merge_dim = vis_hidden * 4  # spatial_merge_size=2
+            sd["model.visual.deepstack_merger_list.0.norm.weight"] = torch.zeros(merge_dim)
+            sd["model.visual.merger.linear_fc2.weight"] = torch.zeros(lm_hidden, merge_dim)
+            logging.info(f"qwen3vl GGUF: injected visual marker tensors (lm_hidden={lm_hidden}, merge_dim={merge_dim}) for model type detection")
     elif arch == "ideogram":
         # Dequantize Ideogram model for inference
         logging.info("Dequantizing Ideogram model for inference...")

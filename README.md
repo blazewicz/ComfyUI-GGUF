@@ -1,6 +1,11 @@
 # ComfyUI-GGUF
 GGUF Quantization support for native ComfyUI models
 
+> [!NOTE]  
+> This is a fork of the original nodes, updated to support loading Ideogram 4 GGUFs and Krea 2 GGUFs. 
+> To use it, clone `https://github.com/city96/ComfyUI-GGUF`and not the original repo.
+
+
 This is currently very much WIP. These custom nodes provide support for model files stored in the GGUF format popularized by [llama.cpp](https://github.com/ggerganov/llama.cpp).
 
 While quantization wasn't feasible for regular UNET models (conv2d), transformer/DiT models such as flux seem less affected by quantization. This allows running it in much lower bits per weight variable bitrate quants on low-end GPUs. For further VRAM savings, a node to load a quantized version of the T5 text encoder is also included.
