@@ -40,15 +40,22 @@ Simply use the GGUF Unet loader found under the `bootleg` category. Place the .g
 
 LoRA loading is experimental but it should work with just the built-in LoRA loader node(s).
 
-Pre-quantized models:
+Pre-quantized models (🍴 icon on ones added by this fork):
 
 - [flux1-dev GGUF](https://huggingface.co/city96/FLUX.1-dev-gguf)
 - [flux1-schnell GGUF](https://huggingface.co/city96/FLUX.1-schnell-gguf)
 - [stable-diffusion-3.5-large GGUF](https://huggingface.co/city96/stable-diffusion-3.5-large-gguf)
 - [stable-diffusion-3.5-large-turbo GGUF](https://huggingface.co/city96/stable-diffusion-3.5-large-turbo-gguf)
+- [Krea 2 (Both Turbo and Raw)](https://huggingface.co/molbal/krea2-gguf) 🍴
+- [Ideogram 4](https://huggingface.co/molbal/ideogram-4-gguff) 🍴
+
+
+> [!IMPORTANT]  
+> Please note, that this fork does not support _K quants on diffusion models, only on text encoders. They may or may not load, but inference speed may be very slow. There may be other forks, or other custom nodes with better support for these quantization types.
 
 Initial support for quantizing T5 has also been added recently, these can be used using the various `*CLIPLoader (gguf)` nodes which can be used inplace of the regular ones. For the CLIP model, use whatever model you were using before for CLIP. The loader can handle both types of files - `gguf` and regular `safetensors`/`bin`.
 
 - [t5_v1.1-xxl GGUF](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
+- [Qwen3-VL-4B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF)🍴
 
 See the instructions in the [tools](https://github.com/city96/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants.
