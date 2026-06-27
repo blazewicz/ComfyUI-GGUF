@@ -296,6 +296,17 @@ def load_state_dict(path):
     return strip_prefix(state_dict)
 
 def handle_tensors(writer, state_dict, model_arch, quant_type=None):
+    # Pre-collect per-tensor FP8 scales (0-dim float32 tensors named "{key}_scale").
+    # These must be applied to their FP8 weight tensors before GGUF quantization.
+    # The actual weight value is fp8_value * scale; ignoring scale produces wrong magnitudes.
+    fp8_scales = {
+        k[:-len("_scale")]: v.item()
+        for k, v in state_dict.items()
+        if k.endswith("_scale") and len(v.shape) == 0 and v.dtype == torch.float32
+    }
+    if fp8_scales:
+        tqdm.write(f"Found {len(fp8_scales)} FP8 per-tensor scale(s); will apply before quantization.")
+
     name_lengths = tuple(sorted(
         ((key, len(key)) for key in state_dict.keys()),
         key=lambda item: item[1],
@@ -314,11 +325,27 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None):
             tqdm.write(f"Filtering ignored key: '{key}'")
             continue
 
+        # comfy_quant tensors are FP8 scale factors specific to ComfyUI's custom FP8 format.
+        # weight_scale tensors are 0-dim per-tensor FP8 scales (e.g. from torchao/fp8 fine-tunes).
+        # Both are meaningless after GGUF re-quantization and must be dropped so the loader
+        # does not try to apply them to already-GGUF-dequantized weights.
+        if key.endswith(".comfy_quant") or key.endswith("_scale") and len(data.shape) == 0:
+            tqdm.write(f"Dropping FP8 scale tensor: '{key}'")
+            continue
+
+        # 0-dim (scalar) tensors cannot be stored in GGUF and have no meaningful weight data.
+        if len(data.shape) == 0:
+            tqdm.write(f"Skipping 0-dim scalar tensor: '{key}'")
+            continue
+
         if data.dtype == torch.bfloat16:
             data = data.to(torch.float32).numpy()
         # this is so we don't break torch 2.0.X
         elif data.dtype in [getattr(torch, "float8_e4m3fn", "_invalid"), getattr(torch, "float8_e5m2", "_invalid")]:
-            data = data.to(torch.float32).numpy()  # cast to f32 for correct downstream quant
+            data = data.to(torch.float32)
+            if key in fp8_scales:
+                data = data * fp8_scales[key]  # apply per-tensor dequantization scale
+            data = data.numpy()
         else:
             data = data.numpy()
 
@@ -341,7 +368,8 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None):
         for dim_size in data_shape:
             n_params *= dim_size
 
-        if old_dtype in (torch.float32, torch.bfloat16):
+        _FP8_DTYPES = {getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)} - {None}
+        if old_dtype in (torch.float32, torch.bfloat16) or old_dtype in _FP8_DTYPES:
             if n_dims == 1:
                 # one-dimensional tensors should be kept in F32
                 # also speeds up inference due to not dequantizing
