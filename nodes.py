@@ -13,7 +13,7 @@ import comfy.model_patcher
 import comfy.model_management
 import folder_paths
 
-from .ops import GGMLOps, GGUFQ4Ops, get_gguf_q8_ops, move_patch_to_device
+from .ops import GGMLOps, get_gguf_q8_ops, move_patch_to_device
 from .loader import gguf_sd_loader, gguf_clip_loader
 from .dequant import is_quantized, is_torch_compatible
 
@@ -156,8 +156,10 @@ class UnetLoaderGGUF:
             # Use ComfyUI native INT8 path (weights stay INT8)
             ops = get_gguf_q8_ops(compute_dtype=torch.bfloat16)()
         elif mode == "int4_pytorch":
-            # Use custom INT4 ops class (currently dequant fallback)
-            ops = GGUFQ4Ops()
+            raise RuntimeError(
+                "Q4_PT is retired because PyTorch's Ampere INT4 kernel is not "
+                "performance-competitive. Reconvert the model as Q8_CR."
+            )
         else:
             ops = GGMLOps()
 
@@ -335,4 +337,3 @@ NODE_CLASS_MAPPINGS = {
     "QuadrupleCLIPLoaderGGUF": QuadrupleCLIPLoaderGGUF,
     "UnetLoaderGGUFAdvanced": UnetLoaderGGUFAdvanced,
 }
-

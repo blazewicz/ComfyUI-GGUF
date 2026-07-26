@@ -355,15 +355,18 @@ def get_gguf_q8_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
     return GGUFQ8Ops
 
 
-class GGUFQ4Ops(comfy.ops.manual_cast):
+# Retired experimental Q4_PT implementation. No loader or node runtime path
+# references this class until a performant W4A16 backend is available.
+class RetiredGGUFQ4Ops(comfy.ops.manual_cast):
     """
-    Ops class for PyTorch's CUDA INT4 matrix multiplication.
+    Ops class for PyTorch's native compact INT4 GEMM.
 
-    GGUF stores a portable nibble-packed representation. The first forward pass
-    for each layer converts it to PyTorch's hardware-specific packed layout on
-    the active CUDA device, and subsequent forwards reuse that packed tensor.
+    Packed weights are created transiently at invocation time. This keeps
+    low-VRAM offloading viable without retaining a second copy of all weights.
     """
     class Linear(torch.nn.Module, comfy.ops.CastWeightBiasOp):
+        comfy_cast_weights = True
+
         def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
             torch.nn.Module.__init__(self)
             self.in_features = in_features
@@ -374,7 +377,6 @@ class GGUFQ4Ops(comfy.ops.manual_cast):
             self._group_size = None
             self._pad = 0
             self._orig_in_features = in_features
-            self._int4_cache = {}
             self._is_int4 = False
 
         def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
@@ -402,7 +404,7 @@ class GGUFQ4Ops(comfy.ops.manual_cast):
                 raise RuntimeError(f"Missing INT4 tensors for {prefix}")
 
             quant_conf = json.loads(bytes(quant_raw.tolist()).decode("utf-8"))
-            if quant_conf.get("format") != "int4_pytorch":
+            if quant_conf.get("format") not in {"int4_compact_gemm", "int4_pytorch"}:
                 raise ValueError(f"Unsupported INT4 format for {prefix}")
             self._group_size = quant_conf["group_size"]
             self._pad = quant_conf.get("pad", 0)
@@ -421,27 +423,6 @@ class GGUFQ4Ops(comfy.ops.manual_cast):
                 if key in missing_keys:
                     missing_keys.remove(key)
 
-        @staticmethod
-        def _inner_k_tiles():
-            return 2
-
-        def _packed_weight(self, device, dtype):
-            if device.type != "cuda":
-                raise RuntimeError("Q4_PT requires CUDA; no dequantization fallback is available.")
-            if dtype not in (torch.float16, torch.bfloat16):
-                raise RuntimeError(f"Q4_PT requires FP16 or BF16 activations, got {dtype}.")
-
-            cache_key = (device, dtype)
-            cached = self._int4_cache.get(cache_key)
-            if cached is not None:
-                return cached
-
-            serialized = self.weight.to(device=device, dtype=torch.uint8, non_blocking=True)
-            packed = torch._convert_weight_to_int4pack(serialized, self._inner_k_tiles())
-            scale_and_offset = self.weight_scale.to(device=device, dtype=dtype, non_blocking=True)
-            self._int4_cache[cache_key] = (packed, scale_and_offset)
-            return packed, scale_and_offset
-
         def forward(self, input):
             if self.weight is None:
                 raise RuntimeError("Q4_PT weight was not loaded.")
@@ -456,9 +437,48 @@ class GGUFQ4Ops(comfy.ops.manual_cast):
             if self._pad:
                 input_2d = torch.nn.functional.pad(input_2d, (0, self._pad))
 
-            packed, scale_and_offset = self._packed_weight(input.device, input.dtype)
+            if self._group_size != 64:
+                raise RuntimeError(
+                    f"Q4_PT requires PyTorch's group-size-64 INT4 operator, got {self._group_size}."
+                )
+            if input_2d.device.type != "cuda":
+                raise RuntimeError("Q4_PT requires a CUDA device.")
+            if input_2d.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    f"Q4_PT requires BF16 activations for PyTorch's native INT4 operator, got {input_2d.dtype}."
+                )
+
+            weight = torch.Tensor(
+                self.weight.to(device=input.device, dtype=torch.uint8, non_blocking=True)
+            )
+            scale_and_offset = self.weight_scale.to(
+                device=input.device,
+                dtype=torch.bfloat16,
+                non_blocking=True,
+            )
+            packed_features = weight.size(-1) * 2
+            native_padding = (-packed_features) % 128
+            if native_padding:
+                # PyTorch's INT4 packer needs K to be a multiple of 128.
+                # A zero-valued group and zero input features preserve the
+                # original result for K=64 projections such as Krea2's input.
+                if native_padding % self._group_size:
+                    raise RuntimeError(
+                        f"Cannot pad Q4_PT input width {packed_features} to PyTorch's INT4 tile size."
+                    )
+                input_2d = torch.nn.functional.pad(input_2d, (0, native_padding))
+                weight = torch.nn.functional.pad(weight, (0, native_padding // 2))
+                scale_and_offset = torch.nn.functional.pad(
+                    scale_and_offset,
+                    (0, 0, 0, 0, 0, native_padding // self._group_size),
+                )
+
+            packed_weight = torch._convert_weight_to_int4pack(weight, 8)
             output = torch._weight_int4pack_mm(
-                input_2d, packed, self._group_size, scale_and_offset
+                input_2d,
+                packed_weight,
+                self._group_size,
+                scale_and_offset,
             )
             if self.bias is not None:
                 output = output + self.bias.to(device=input.device, dtype=input.dtype)

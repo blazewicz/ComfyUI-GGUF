@@ -1,34 +1,27 @@
 # ComfyUI-GGUF
-GGUF Quantization support for native ComfyUI models
+GGUF Quantization support for native ComfyUI models including the custom Q8_CR
 
 > [!NOTE]  
 > This is a fork of the original nodes, updated to support loading Ideogram 4 GGUFs and Krea 2 GGUFs. 
 > To use it, clone `https://github.com/city96/ComfyUI-GGUF`and not the original repo.
 
-
-This is currently very much WIP. These custom nodes provide support for model files stored in the GGUF format popularized by [llama.cpp](https://github.com/ggerganov/llama.cpp).
-
 While quantization wasn't feasible for regular UNET models (conv2d), transformer/DiT models such as flux seem less affected by quantization. This allows running it in much lower bits per weight variable bitrate quants on low-end GPUs. For further VRAM savings, a node to load a quantized version of the T5 text encoder is also included.
-
-![Comfy_Flux1_dev_Q4_0_GGUF_1024](https://github.com/user-attachments/assets/70d16d97-c522-4ef4-9435-633f128644c8)
-
-Note: The "Force/Set CLIP Device" is **NOT** part of this node pack. Do not install it if you only have one GPU. Do not set it to cuda:0 then complain about OOM errors if you do not undestand what it is for. There is not need to copy the workflow above, just use your own workflow and replace the stock "Load Diffusion Model" with the "Unet Loader (GGUF)" node.
 
 ## Installation
 
 > [!IMPORTANT]  
-> Make sure your ComfyUI is on a recent-enough version to support custom ops when loading the UNET-only.
+> Make sure your ComfyUI is on v0.27.0 or later.
 
 To install the custom node normally, git clone this repository into your custom nodes folder (`ComfyUI/custom_nodes`) and install the only dependency for inference (`pip install --upgrade gguf`)
 
 ```
-git clone https://github.com/city96/ComfyUI-GGUF
+git clone https://github.com/molbal/ComfyUI-GGUF
 ```
 
 To install the custom node on a standalone ComfyUI release, open a CMD inside the "ComfyUI_windows_portable" folder (where your `run_nvidia_gpu.bat` file is) and use the following commands:
 
 ```
-git clone https://github.com/city96/ComfyUI-GGUF ComfyUI/custom_nodes/ComfyUI-GGUF
+git clone https://github.com/molbal/ComfyUI-GGUF ComfyUI/custom_nodes/ComfyUI-GGUF
 .\python_embeded\python.exe -s -m pip install -r .\ComfyUI\custom_nodes\ComfyUI-GGUF\requirements.txt
 ```
 
@@ -68,14 +61,23 @@ UNets:
 - `Q8_CR` stores eligible 2-D Linear weights as per-row INT8 ConvRot. It uses
   ComfyUI's native `TensorWiseINT8Layout` path, so weights remain INT8 during
   inference.
-- `Q4_PT` stores eligible 2-D Linear weights as group-size-64 INT4 and uses
-  PyTorch's CUDA `_weight_int4pack_mm` path. The first use of each layer creates
-  the device-specific packed representation; weights are not dequantized.
 
-Both modes keep 1-D, small, and architecture-designated high-precision tensors
+Q8_CR keeps 1-D, small, and architecture-designated high-precision tensors
 in FP32. Conv2d weights remain FP16 because these modes accelerate Linear
-matrix multiplication only. `Q4_PT` requires CUDA with FP16 or BF16
-activations; it intentionally has no CPU or dequantization fallback.
+matrix multiplication only.
+
+### Q8_CR platform support
+
+Q8_CR does not require CUDA. It uses ComfyUI's `comfy_kitchen` layout backend:
+
+- NVIDIA CUDA uses ComfyUI's optimized native INT8 backend when available.
+- Linux and non-CUDA environments use the `comfy_kitchen` eager backend.
+- CPU Q8_CR loading and inference are supported, but naturally slower than
+  optimized CUDA inference.
+
+Q4_PT is retired from conversion and loading until a performant W4A16 backend
+is available. Its experimental implementation remains in the source for future
+work, but it is no longer selectable or loadable.
 
 Reconvert any `Q8_CR` GGUF created before ConvRot weights were marked as
 pre-rotated. Older files load safely with native non-rotated INT8 instead.

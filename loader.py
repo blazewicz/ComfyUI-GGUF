@@ -188,6 +188,12 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         quant_conf = json.loads(str(field.parts[field.data[-1]], "utf-8"))
         fmt = quant_conf.get("format")
 
+        if fmt in {"int4_compact_gemm", "int4_pytorch"}:
+            raise ValueError(
+                "Q4_PT GGUF files are retired because PyTorch's Ampere INT4 "
+                "kernel is not performance-competitive. Reconvert as Q8_CR."
+            )
+
         weight_key = key
         scale_key = f"{key}_scale"
         if weight_key not in state_dict or scale_key not in state_dict:
@@ -235,9 +241,18 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             )
             extra["gguf_quant_mode"] = "int8_convrot"
 
-        elif fmt == "int4_pytorch":
-            # Keep serialized INT4 weights; custom ops pack them for the CUDA kernel.
-            weight = weight_ggml.data.view(torch.uint8).reshape(weight_ggml.tensor_shape)
+        # Retained loader adaptation for the retired Q4_PT experiment. The
+        # explicit rejection above prevents this branch from being executed.
+        elif fmt in {"int4_compact_gemm", "int4_pytorch"}:
+            # Keep compact INT4 storage while exposing the original shape to
+            # ComfyUI's model detector. It uses first.weight.shape to infer
+            # Krea2's latent channel count before custom ops load the tensor.
+            orig_shape = torch.Size(tuple(quant_conf["orig_shape"]))
+            weight = GGMLTensor(
+                weight_ggml.data.view(torch.uint8).reshape(weight_ggml.tensor_shape),
+                tensor_type=weight_ggml.tensor_type,
+                tensor_shape=orig_shape,
+            )
             scale = scale_ggml.data.view(torch.float32).reshape(scale_ggml.tensor_shape)
 
             state_dict[weight_key] = torch.nn.Parameter(weight, requires_grad=False)
@@ -535,10 +550,10 @@ def gguf_gemma3_tokenizer_loader(path):
     tokens = get_list_field(reader, "tokenizer.ggml.tokens", str)
     scores = get_list_field(reader, "tokenizer.ggml.scores", float)
     toktype = get_list_field(reader, "tokenizer.ggml.token_type", int)
-    
+
     if not tokens or not scores or not toktype:
         raise ValueError("Missing tokenizer metadata")
-    
+
     for idx in range(len(tokens)):
         piece = spm.SentencePiece()
         piece.piece = tokens[idx]
@@ -549,10 +564,10 @@ def gguf_gemma3_tokenizer_loader(path):
             piece.type = toktype[idx]
             piece.score = scores[idx]
         spm.pieces.append(piece)
-    
+
     spm.trainer_spec.vocab_size = len(spm.pieces)
     logging.info(f"Created tokenizer with vocab size of {len(spm.pieces)}")
-    
+
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
