@@ -53,10 +53,89 @@ Initial support for quantizing T5 has also been added recently, these can be use
 
 See the instructions in the [tools](https://github.com/city96/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants.
 
+## Converting Krea 2 and Ideogram 4 models
+
+The converter detects supported Krea 2 and Ideogram 4 checkpoints directly.
+Provide an existing `.safetensors`, `.ckpt`, `.pt`, `.pth`, or `.bin` diffusion
+model file; no model-specific conversion script is required.
+
+Run these commands from the `ComfyUI-GGUF` directory, replacing the source and
+destination paths with your model names:
+
+```bash
+# Compact standard GGUF
+python tools/convert.py --src /path/to/krea2_or_ideogram.safetensors \
+  --dst /path/to/model-Q4_0.gguf --quant-type Q4_0
+
+# Higher-quality standard GGUF
+python tools/convert.py --src /path/to/krea2_or_ideogram.safetensors \
+  --dst /path/to/model-Q8_0.gguf --quant-type Q8_0
+
+# Recommended for RTX 30-series NVIDIA GPUs
+python tools/convert.py --src /path/to/krea2_or_ideogram.safetensors \
+  --dst /path/to/model-Q8_CR.gguf --quant-type Q8_CR
+```
+
+For the portable Windows distribution, use its embedded Python executable:
+
+```bat
+.\python_embeded\python.exe .\ComfyUI\custom_nodes\ComfyUI-GGUF\tools\convert.py ^
+  --src C:\path\to\krea2_or_ideogram.safetensors ^
+  --dst C:\path\to\model-Q8_CR.gguf --quant-type Q8_CR
+```
+
+Place the resulting GGUF in `ComfyUI/models/unet` or
+`ComfyUI/models/diffusion_models`, then load it with **Unet Loader (GGUF)**.
+
+## Supported conversion formats
+
+The standard GGUF formats use the package's normal GGML loader path. `Q8_CR`
+is a custom ComfyUI-native INT8 layout for eligible Linear weights.
+
+| Format | Storage / execution | Recommended use |
+| --- | --- | --- |
+| `F16` | FP16 GGUF | Maximum compatibility with half-precision storage. |
+| `BF16` | BF16 GGUF | Preserve BF16 source models where the target supports BF16. |
+| `Q8_0` | Standard GGML 8-bit quantization | Excellent general-quality 8-bit GGUF; portable and straightforward to offload. |
+| `Q5_1` | Standard GGML 5-bit quantization | Lower storage with a quality-oriented 5-bit format. |
+| `Q5_0` | Standard GGML 5-bit quantization | Lower storage alternative to `Q5_1`. |
+| `Q4_1` | Standard GGML 4-bit quantization | Smaller files when VRAM or RAM is constrained. |
+| `Q4_0` | Standard GGML 4-bit quantization | Smallest supported standard diffusion-model format; expect the largest quality trade-off. |
+| `Q8_CR` | Per-row INT8 ConvRot through ComfyUI native ops | **Maintainer recommendation for NVIDIA RTX 30-series systems.** |
+
+
+> [!WARNING]
+> `_K` quant formats are not supported for diffusion models; they are supported only for text encoders.
+
 ## Native weight-only quantization
 
-The converter supports two custom, global quantization modes for DiT/transformer
-UNets:
+The converter supports one custom global quantization mode for DiT/transformer
+UNets: `Q8_CR`.
+
+### What Q8_CR is, why it exists, and how it works
+
+`Q8_CR` is an INT8 weight-only format designed for transformer-style diffusion
+models. Its purpose is to reduce GGUF model storage and VRAM pressure while
+preserving the fast native INT8 Linear operations available on supported NVIDIA
+GPUs. It is especially useful when the full diffusion model does not fit in
+VRAM and ComfyUI needs to offload weights to CPU memory.
+
+During conversion, the converter:
+
+1. Selects eligible 2-D Linear weights. One-dimensional tensors, small
+   tensors, and architecture-designated sensitive tensors stay FP32; Conv2d
+   weights stay FP16.
+2. Applies the compatible ConvRot/Hadamard rotation to each eligible weight
+   matrix.
+3. Quantizes the rotated weights to INT8 using an FP32 scale for every output
+   row.
+4. Stores the INT8 payload, scales, and ConvRot metadata in the GGUF file.
+
+During loading, the GGUF loader recognizes this metadata and passes the raw
+INT8 weights and row scales to ComfyUI's `TensorWiseINT8Layout`. On supported
+CUDA systems, ComfyUI executes the native INT8/ConvRot Linear path directly;
+it does not first expand the weight matrix to FP16 or BF16. The ordinary GGUF
+container still provides memory-mapped loading and CPU offload behavior.
 
 - `Q8_CR` stores eligible 2-D Linear weights as per-row INT8 ConvRot. It uses
   ComfyUI's native `TensorWiseINT8Layout` path, so weights remain INT8 during
@@ -65,6 +144,20 @@ UNets:
 Q8_CR keeps 1-D, small, and architecture-designated high-precision tensors
 in FP32. Conv2d weights remain FP16 because these modes accelerate Linear
 matrix multiplication only.
+
+### Maintainer recommendation: Q8_CR on RTX 30-series
+
+For NVIDIA RTX 30-series systems, the maintainer recommends `Q8_CR` for Krea 2
+and Ideogram 4. It combines:
+
+- Fast native INT8 operations on these GPUs through ComfyUI's ConvRot backend.
+- GGUF's convenient CPU offload and memory-mapped model storage behavior.
+- The generally excellent image quality expected from 8-bit GGUF
+  quantization, while retaining selected sensitive tensors in higher precision.
+
+Use `Q8_0` instead when you need the conventional portable GGML 8-bit format.
+Use `Q4_0` primarily when the smaller model footprint matters more than
+quality or sampling speed.
 
 ### Q8_CR platform support
 
