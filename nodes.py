@@ -13,7 +13,7 @@ import comfy.model_patcher
 import comfy.model_management
 import folder_paths
 
-from .ops import GGMLOps, move_patch_to_device
+from .ops import GGMLOps, GGUFQ4Ops, get_gguf_q8_ops, move_patch_to_device
 from .loader import gguf_sd_loader, gguf_clip_loader
 from .dequant import is_quantized, is_torch_compatible
 
@@ -148,7 +148,18 @@ class UnetLoaderGGUF:
     TITLE = "Unet Loader (GGUF)"
 
     def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
-        ops = GGMLOps()
+        unet_path = folder_paths.get_full_path("unet", unet_name)
+        sd, extra = gguf_sd_loader(unet_path)
+
+        mode = extra.get("gguf_quant_mode")
+        if mode == "int8_convrot":
+            # Use ComfyUI native INT8 path (weights stay INT8)
+            ops = get_gguf_q8_ops(compute_dtype=torch.bfloat16)()
+        elif mode == "int4_pytorch":
+            # Use custom INT4 ops class (currently dequant fallback)
+            ops = GGUFQ4Ops()
+        else:
+            ops = GGMLOps()
 
         if dequant_dtype in ("default", None):
             ops.Linear.dequant_dtype = None
@@ -165,8 +176,6 @@ class UnetLoaderGGUF:
             ops.Linear.patch_dtype = getattr(torch, patch_dtype)
 
         # init model
-        unet_path = folder_paths.get_full_path("unet", unet_name)
-        sd, extra = gguf_sd_loader(unet_path)
 
         kwargs = {}
         valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters

@@ -1,5 +1,6 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import gguf
+import json
 import torch
 import logging
 
@@ -313,3 +314,152 @@ def move_patch_to_device(item, device):
         return [move_patch_to_device(x, device) for x in item]
     else:
         return item
+
+def get_gguf_q8_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
+    """
+    Factory for an ops class that uses ComfyUI's native mixed_precision_ops INT8 path.
+    Weights are kept as INT8 and matmul uses comfy_kitchen's TensorWiseINT8Layout.
+    """
+    BaseOps = comfy.ops.mixed_precision_ops(
+        quant_config={},
+        compute_dtype=compute_dtype,
+        full_precision_mm=full_precision_mm,
+    )
+
+    class GGUFQ8Ops(BaseOps):
+        class Linear(BaseOps.Linear):
+            def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+                # Lazy init: don't allocate weight here; it will be loaded from state dict
+                torch.nn.Module.__init__(self)
+                self.factory_kwargs = {"device": device, "dtype": BaseOps._compute_dtype}
+                self.in_features = in_features
+                self.out_features = out_features
+                self.weight = None
+                if bias:
+                    self.bias = torch.nn.Parameter(torch.empty(out_features, **self.factory_kwargs))
+                else:
+                    self.register_parameter("bias", None)
+                self._orig_shape = (out_features, in_features)
+                self.tensor_class = None
+                self._full_precision_mm = BaseOps._full_precision_mm
+                self._full_precision_mm_config = False
+
+            def _load_from_state_dict(self, *args):
+                return comfy.ops._load_quantized_module(
+                    self,
+                    torch.nn.Module._load_from_state_dict.__get__(self, type(self)),
+                    *args,
+                    load_extra_params=True,
+                )
+
+    return GGUFQ8Ops
+
+
+class GGUFQ4Ops(comfy.ops.manual_cast):
+    """
+    Ops class for PyTorch's CUDA INT4 matrix multiplication.
+
+    GGUF stores a portable nibble-packed representation. The first forward pass
+    for each layer converts it to PyTorch's hardware-specific packed layout on
+    the active CUDA device, and subsequent forwards reuse that packed tensor.
+    """
+    class Linear(torch.nn.Module, comfy.ops.CastWeightBiasOp):
+        def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+            torch.nn.Module.__init__(self)
+            self.in_features = in_features
+            self.out_features = out_features
+            self.weight = None
+            self.register_parameter("bias", None)
+            self._orig_shape = (out_features, in_features)
+            self._group_size = None
+            self._pad = 0
+            self._orig_in_features = in_features
+            self._int4_cache = {}
+            self._is_int4 = False
+
+        def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+            weight_key = f"{prefix}weight"
+            scale_key = f"{prefix}weight_scale"
+            quant_key = f"{prefix}comfy_quant"
+
+            weight = state_dict.pop(weight_key, None)
+            scale = state_dict.pop(scale_key, None)
+            quant_raw = state_dict.pop(quant_key, None)
+
+            bias_key = f"{prefix}bias"
+            bias = state_dict.pop(bias_key, None)
+            if quant_raw is None:
+                if weight is None:
+                    missing_keys.append(weight_key)
+                    return
+                self.weight = torch.nn.Parameter(torch.Tensor(weight), requires_grad=False)
+                if bias is not None:
+                    self.bias = torch.nn.Parameter(torch.Tensor(bias), requires_grad=False)
+                self._is_int4 = False
+                return
+
+            if weight is None or scale is None:
+                raise RuntimeError(f"Missing INT4 tensors for {prefix}")
+
+            quant_conf = json.loads(bytes(quant_raw.tolist()).decode("utf-8"))
+            if quant_conf.get("format") != "int4_pytorch":
+                raise ValueError(f"Unsupported INT4 format for {prefix}")
+            self._group_size = quant_conf["group_size"]
+            self._pad = quant_conf.get("pad", 0)
+            orig_shape = tuple(quant_conf["orig_shape"])
+            self._orig_in_features = orig_shape[1]
+            self._orig_shape = orig_shape
+            self.out_features = orig_shape[0]
+
+            self.weight = torch.nn.Parameter(weight, requires_grad=False)
+            self.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+            self._is_int4 = True
+
+            if bias is not None:
+                self.bias = torch.nn.Parameter(bias, requires_grad=False)
+            for key in (weight_key, scale_key, quant_key, bias_key):
+                if key in missing_keys:
+                    missing_keys.remove(key)
+
+        @staticmethod
+        def _inner_k_tiles():
+            return 2
+
+        def _packed_weight(self, device, dtype):
+            if device.type != "cuda":
+                raise RuntimeError("Q4_PT requires CUDA; no dequantization fallback is available.")
+            if dtype not in (torch.float16, torch.bfloat16):
+                raise RuntimeError(f"Q4_PT requires FP16 or BF16 activations, got {dtype}.")
+
+            cache_key = (device, dtype)
+            cached = self._int4_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+            serialized = self.weight.to(device=device, dtype=torch.uint8, non_blocking=True)
+            packed = torch._convert_weight_to_int4pack(serialized, self._inner_k_tiles())
+            scale_and_offset = self.weight_scale.to(device=device, dtype=dtype, non_blocking=True)
+            self._int4_cache[cache_key] = (packed, scale_and_offset)
+            return packed, scale_and_offset
+
+        def forward(self, input):
+            if self.weight is None:
+                raise RuntimeError("Q4_PT weight was not loaded.")
+            if not self._is_int4:
+                weight = self.weight.to(device=input.device, dtype=input.dtype)
+                bias = self.bias.to(device=input.device, dtype=input.dtype) if self.bias is not None else None
+                return torch.nn.functional.linear(input, weight, bias)
+            if self.weight_function or self.bias_function:
+                raise RuntimeError("Q4_PT does not support weight patches or LoRAs without dequantization.")
+            input_shape = input.shape
+            input_2d = input.reshape(-1, input_shape[-1])
+            if self._pad:
+                input_2d = torch.nn.functional.pad(input_2d, (0, self._pad))
+
+            packed, scale_and_offset = self._packed_weight(input.device, input.dtype)
+            output = torch._weight_int4pack_mm(
+                input_2d, packed, self._group_size, scale_and_offset
+            )
+            if self.bias is not None:
+                output = output + self.bias.to(device=input.device, dtype=input.dtype)
+            return output.reshape(*input_shape[:-1], self.out_features)

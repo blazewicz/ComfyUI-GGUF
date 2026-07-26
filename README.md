@@ -59,3 +59,23 @@ Initial support for quantizing T5 has also been added recently, these can be use
 - [Qwen3-VL-4B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF)🍴
 
 See the instructions in the [tools](https://github.com/city96/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants.
+
+## Native weight-only quantization
+
+The converter supports two custom, global quantization modes for DiT/transformer
+UNets:
+
+- `Q8_CR` stores eligible 2-D Linear weights as per-row INT8 ConvRot. It uses
+  ComfyUI's native `TensorWiseINT8Layout` path, so weights remain INT8 during
+  inference.
+- `Q4_PT` stores eligible 2-D Linear weights as group-size-64 INT4 and uses
+  PyTorch's CUDA `_weight_int4pack_mm` path. The first use of each layer creates
+  the device-specific packed representation; weights are not dequantized.
+
+Both modes keep 1-D, small, and architecture-designated high-precision tensors
+in FP32. Conv2d weights remain FP16 because these modes accelerate Linear
+matrix multiplication only. `Q4_PT` requires CUDA with FP16 or BF16
+activations; it intentionally has no CPU or dequantization fallback.
+
+Reconvert any `Q8_CR` GGUF created before ConvRot weights were marked as
+pre-rotated. Older files load safely with native non-rotated INT8 instead.
