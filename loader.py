@@ -3,9 +3,9 @@ import warnings
 import logging
 import torch
 import gguf
+import json
 import re
 import os
-
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
@@ -177,6 +177,93 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         "arch_str": arch_str,
         "metadata": get_gguf_metadata(reader)
     }
+
+    # Detect custom ComfyUI native quantization metadata
+    warned_unrotated_convrot = False
+    for field_name in reader.fields:
+        if not field_name.startswith("comfy.gguf.quant."):
+            continue
+        key = field_name[len("comfy.gguf.quant."):]
+        field = reader.get_field(field_name)
+        quant_conf = json.loads(str(field.parts[field.data[-1]], "utf-8"))
+        fmt = quant_conf.get("format")
+
+        if fmt in {"int4_compact_gemm", "int4_pytorch"}:
+            raise ValueError(
+                "Q4_PT GGUF files are retired because PyTorch's Ampere INT4 "
+                "kernel is not performance-competitive. Reconvert as Q8_CR."
+            )
+
+        weight_key = key
+        scale_key = f"{key}_scale"
+        if weight_key not in state_dict or scale_key not in state_dict:
+            logging.warning(f"Missing custom quant tensors for {weight_key}")
+            continue
+
+        weight_ggml = state_dict[weight_key]
+        scale_ggml = state_dict[scale_key]
+
+        if fmt == "int8_tensorwise":
+            if quant_conf.get("convrot") and not quant_conf.get("weight_rotated", False):
+                if not warned_unrotated_convrot:
+                    logging.warning(
+                        "Disabling ConvRot because this GGUF does not mark its weights "
+                        "as pre-rotated. Reconvert with the current converter to enable ConvRot."
+                    )
+                    warned_unrotated_convrot = True
+                quant_conf["convrot"] = False
+                quant_conf.pop("convrot_groupsize", None)
+            elif quant_conf.get("convrot"):
+                groupsize = quant_conf.get("convrot_groupsize", 256)
+                if weight_ggml.tensor_shape[-1] % groupsize != 0:
+                    logging.warning(
+                        "Disabling ConvRot for %s because %d input features are not "
+                        "divisible by group size %d.",
+                        weight_key,
+                        weight_ggml.tensor_shape[-1],
+                        groupsize,
+                    )
+                    quant_conf["convrot"] = False
+                    quant_conf.pop("convrot_groupsize", None)
+
+            # Convert to ComfyUI native state-dict layout
+            weight = weight_ggml.data.view(torch.int8).reshape(weight_ggml.tensor_shape)
+            scale = scale_ggml.data.view(torch.float32).reshape(scale_ggml.tensor_shape)
+
+            state_dict[weight_key] = torch.nn.Parameter(weight, requires_grad=False)
+            state_dict[scale_key] = torch.nn.Parameter(scale, requires_grad=False)
+
+            layer_prefix = weight_key[:weight_key.rfind("weight")]
+            quant_json = json.dumps(quant_conf)
+            state_dict[f"{layer_prefix}comfy_quant"] = torch.nn.Parameter(
+                torch.tensor(list(quant_json.encode("utf-8")), dtype=torch.uint8),
+                requires_grad=False,
+            )
+            extra["gguf_quant_mode"] = "int8_convrot"
+
+        # Retained loader adaptation for the retired Q4_PT experiment. The
+        # explicit rejection above prevents this branch from being executed.
+        elif fmt in {"int4_compact_gemm", "int4_pytorch"}:
+            # Keep compact INT4 storage while exposing the original shape to
+            # ComfyUI's model detector. It uses first.weight.shape to infer
+            # Krea2's latent channel count before custom ops load the tensor.
+            orig_shape = torch.Size(tuple(quant_conf["orig_shape"]))
+            weight = GGMLTensor(
+                weight_ggml.data.view(torch.uint8).reshape(weight_ggml.tensor_shape),
+                tensor_type=weight_ggml.tensor_type,
+                tensor_shape=orig_shape,
+            )
+            scale = scale_ggml.data.view(torch.float32).reshape(scale_ggml.tensor_shape)
+
+            state_dict[weight_key] = torch.nn.Parameter(weight, requires_grad=False)
+            state_dict[scale_key] = torch.nn.Parameter(scale, requires_grad=False)
+            layer_prefix = weight_key[:weight_key.rfind("weight")]
+            state_dict[f"{layer_prefix}comfy_quant"] = torch.nn.Parameter(
+                torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8),
+                requires_grad=False,
+            )
+            extra["gguf_quant_mode"] = "int4_pytorch"
+
     return (state_dict, extra)
 
 # for remapping llama.cpp -> original key names
@@ -463,10 +550,10 @@ def gguf_gemma3_tokenizer_loader(path):
     tokens = get_list_field(reader, "tokenizer.ggml.tokens", str)
     scores = get_list_field(reader, "tokenizer.ggml.scores", float)
     toktype = get_list_field(reader, "tokenizer.ggml.token_type", int)
-    
+
     if not tokens or not scores or not toktype:
         raise ValueError("Missing tokenizer metadata")
-    
+
     for idx in range(len(tokens)):
         piece = spm.SentencePiece()
         piece.piece = tokens[idx]
@@ -477,10 +564,10 @@ def gguf_gemma3_tokenizer_loader(path):
             piece.type = toktype[idx]
             piece.score = scores[idx]
         spm.pieces.append(piece)
-    
+
     spm.trainer_spec.vocab_size = len(spm.pieces)
     logging.info(f"Created tokenizer with vocab size of {len(spm.pieces)}")
-    
+
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 

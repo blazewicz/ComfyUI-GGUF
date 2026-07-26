@@ -1,6 +1,7 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import os
 import gguf
+import json
 import torch
 import logging
 import argparse
@@ -228,7 +229,84 @@ QUANT_TYPE_MAP = {
     "Q5_0": (gguf.GGMLQuantizationType.Q5_0, gguf.LlamaFileType.MOSTLY_Q5_0),
     "Q4_1": (gguf.GGMLQuantizationType.Q4_1, gguf.LlamaFileType.MOSTLY_Q4_1),
     "Q4_0": (gguf.GGMLQuantizationType.Q4_0, gguf.LlamaFileType.MOSTLY_Q4_0),
+    "Q8_CR": (gguf.GGMLQuantizationType.I8, None),  # INT8 ConvRot (ComfyUI native)
+    # Q4_PT is retired pending a performant Ampere W4A16 backend.
+    # "Q4_PT": (gguf.GGMLQuantizationType.I8, None),
 }
+
+
+def quantize_int8_convrot(weight, convrot_groupsize=256):
+    """
+    Quantize a 2D Linear weight to INT8 with ConvRot grouping.
+    Uses per-output-channel scales to match ComfyUI's TensorWiseINT8Layout.
+    """
+    weight = weight.to(torch.float32)
+    orig_shape = tuple(weight.shape)
+    groupsize = next(
+        (
+            size
+            for size in (convrot_groupsize, 64, 16, 4)
+            if size <= weight.shape[1] and weight.shape[1] % size == 0
+        ),
+        None,
+    )
+    if groupsize is not None:
+        from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
+
+        hadamard = _build_hadamard(groupsize, device=weight.device, dtype=weight.dtype)
+        weight = _rotate_weight(weight, hadamard, groupsize)
+
+    scale = weight.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 127.0
+    qdata = (weight / scale).round().clamp(-128, 127).to(torch.int8)
+    quant_conf = {
+        "format": "int8_tensorwise",
+        "convrot": groupsize is not None,
+        "weight_rotated": groupsize is not None,
+        "per_row": True,
+    }
+    if groupsize is not None:
+        quant_conf["convrot_groupsize"] = groupsize
+    return qdata, scale, quant_conf, orig_shape
+
+
+def retired_quantize_int4_pytorch(weight, group_size=64):
+    """
+    Quantize a 2D Linear weight for PyTorch's native INT4 kernel.
+    Weights are serialized as packed uint8 [n, k//2]. The runtime converts this
+    portable representation to PyTorch's device-specific INT4 layout.
+    """
+    orig_shape = tuple(weight.shape)
+    n, k = orig_shape
+    weight = weight.to(torch.float32)
+
+    pad = 0
+    if k % group_size != 0:
+        pad = group_size - (k % group_size)
+        weight = torch.nn.functional.pad(weight, (0, pad))
+        k = k + pad
+
+    w_grouped = weight.reshape(n, k // group_size, group_size)
+    w_min = w_grouped.amin(dim=-1, keepdim=True)
+    w_max = w_grouped.amax(dim=-1, keepdim=True)
+    scale = (w_max - w_min) / 15.0
+    scale = scale.clamp_min(1e-9)
+    q = ((w_grouped - w_min) / scale).round().clamp(0, 15).to(torch.uint8)
+
+    q_flat = q.reshape(n, k)
+    packed = ((q_flat[:, 0::2] << 4) | q_flat[:, 1::2]).to(torch.uint8)
+
+    qsz = torch.zeros(k // group_size, n, 2, dtype=torch.float32)
+    qsz[:, :, 0] = scale.reshape(n, k // group_size).t()
+    # _weight_int4pack_mm dequantizes as (q - 8) * scale + offset.
+    qsz[:, :, 1] = (w_min + 8 * scale).reshape(n, k // group_size).t()
+
+    quant_conf = {
+        "format": "int4_compact_gemm",
+        "group_size": group_size,
+        "orig_shape": orig_shape,
+        "pad": pad,
+    }
+    return packed, qsz, quant_conf, orig_shape
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -295,7 +373,7 @@ def load_state_dict(path):
 
     return strip_prefix(state_dict)
 
-def handle_tensors(writer, state_dict, model_arch, quant_type=None):
+def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_name=None):
     # Pre-collect per-tensor FP8 scales (0-dim float32 tensors named "{key}_scale").
     # These must be applied to their FP8 weight tensors before GGUF quantization.
     # The actual weight value is fp8_value * scale; ignoring scale produces wrong magnitudes.
@@ -358,34 +436,51 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None):
         else:
             data_qtype = gguf.GGMLQuantizationType.F16
 
-        # The max no. of dimensions that can be handled by the quantization code is 4
-        if len(data.shape) > MAX_TENSOR_DIMS:
+        # The max no. of dimensions that can be handled by the quantization code is 4.
+        if n_dims > MAX_TENSOR_DIMS:
             model_arch.handle_nd_tensor(key, data)
-            continue # needs to be added back later
+            continue
 
-        # get number of parameters (AKA elements) in this tensor
         n_params = 1
         for dim_size in data_shape:
             n_params *= dim_size
 
         _FP8_DTYPES = {getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)} - {None}
-        if old_dtype in (torch.float32, torch.bfloat16) or old_dtype in _FP8_DTYPES:
+        apply_quantization_rules = (
+            quant_type_name == "Q8_CR"
+            or old_dtype in (torch.float32, torch.bfloat16)
+            or old_dtype in _FP8_DTYPES
+        )
+        if apply_quantization_rules:
             if n_dims == 1:
-                # one-dimensional tensors should be kept in F32
-                # also speeds up inference due to not dequantizing
+                # One-dimensional tensors should be kept in F32.
                 data_qtype = gguf.GGMLQuantizationType.F32
-
             elif n_params <= QUANTIZATION_THRESHOLD:
-                # very small tensors
                 data_qtype = gguf.GGMLQuantizationType.F32
-
             elif any(x in key for x in model_arch.keys_hiprec):
-                # tensors that require max precision
                 data_qtype = gguf.GGMLQuantizationType.F32
-
+            elif n_dims == 4 and "conv" in key.lower():
+                # Native quantized paths are Linear-only.
+                data_qtype = gguf.GGMLQuantizationType.F16
             elif quant_type is not None:
-                # caller-specified quantization type for all eligible tensors
                 data_qtype = quant_type
+
+        if quant_type_name == "Q8_CR" and n_dims > 1 and n_dims != 2:
+            # Custom native layouts only represent Linear matrices.
+            data_qtype = gguf.GGMLQuantizationType.F16
+        # Q4_PT layout restrictions are retained with
+        # retired_quantize_int4_pytorch and are intentionally not selectable.
+
+        # Q8_CR is the supported custom quantization path.
+        if quant_type_name == "Q8_CR" and data_qtype == quant_type and n_dims == 2:
+            if quant_type_name == "Q8_CR":
+                qdata, scale, quant_conf, orig_shape = quantize_int8_convrot(torch.from_numpy(data))
+                writer.add_tensor(key, qdata.numpy(), raw_dtype=gguf.GGMLQuantizationType.I8)
+                writer.add_tensor(f"{key}_scale", scale.numpy(), raw_dtype=gguf.GGMLQuantizationType.F32)
+                writer.add_string(f"comfy.gguf.quant.{key}", json.dumps(quant_conf))
+                continue
+
+            # Q4_PT emission is retired with its runtime backend.
 
         if (model_arch.shape_fix                        # NEVER reshape for models such as flux
             and n_dims > 1                              # Skip one-dimensional tensors
@@ -455,7 +550,7 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type
     if ftype_gguf is not None:
         writer.add_file_type(ftype_gguf)
 
-    handle_tensors(writer, state_dict, model_arch, quant_type=quant_type)
+    handle_tensors(writer, state_dict, model_arch, quant_type=quant_type, quant_type_name=quant_type_name)
     writer.write_header_to_file(path=dst_path)
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
