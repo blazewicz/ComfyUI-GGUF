@@ -11,6 +11,7 @@ import comfy.float
 import comfy.utils
 import comfy.model_patcher
 import comfy.model_management
+import comfy.memory_management
 import folder_paths
 
 from .ops import GGMLOps, get_gguf_q8_ops, move_patch_to_device
@@ -194,6 +195,95 @@ class UnetLoaderGGUF:
         model.patch_on_device = patch_on_device
         return (model,)
 
+
+def _require_dynamic_vram():
+    if not comfy.memory_management.aimdo_enabled:
+        raise RuntimeError(
+            "Dynamic VRAM is not enabled in this ComfyUI installation. "
+            "Start ComfyUI without --disable-dynamic-vram and use a build that supports DynamicVRAM."
+        )
+
+
+def _clone_as_dynamic_gguf_patcher(model_patcher):
+    source_class = model_patcher.__class__
+    model_patcher.__class__ = GGUFModelPatcherDynamic
+    cloned = model_patcher.clone()
+    model_patcher.__class__ = source_class
+    return cloned
+
+
+def _legacy_gguf_ops(extra):
+    mode = extra.get("gguf_quant_mode")
+    if mode == "int8_convrot":
+        return get_gguf_q8_ops(compute_dtype=torch.bfloat16)()
+    if mode == "int4_pytorch":
+        raise RuntimeError(
+            "Q4_PT is retired because PyTorch's Ampere INT4 kernel is not "
+            "performance-competitive. Reconvert the model as Q8_CR."
+        )
+    return GGMLOps()
+
+
+def _load_dynamic_gguf_unet(unet_path, disable_dynamic=False):
+    if not disable_dynamic:
+        _require_dynamic_vram()
+    sd, extra = gguf_sd_loader(unet_path, dynamic=not disable_dynamic)
+
+    kwargs = {}
+    valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters
+    if "metadata" in valid_params:
+        kwargs["metadata"] = extra.get("metadata", {})
+
+    model_options = {} if not disable_dynamic else {
+        "custom_operations": _legacy_gguf_ops(extra),
+    }
+    model = comfy.sd.load_diffusion_model_state_dict(
+        sd,
+        model_options=model_options,
+        disable_dynamic=disable_dynamic,
+        **kwargs,
+    )
+    if model is None:
+        logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
+        raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
+    model = GGUFModelPatcher.clone(model) if disable_dynamic else _clone_as_dynamic_gguf_patcher(model)
+    model.cached_patcher_init = (_load_dynamic_gguf_unet, (unet_path,))
+    return model
+
+
+class GGUFModelPatcherDynamic(comfy.model_patcher.ModelPatcherDynamic):
+    def load(self, *args, **kwargs):
+        super().load(*args, **kwargs)
+        # GGML weights cannot be requantized after applying a LoRA patch.
+        for _, module in self.model.named_modules():
+            for param_key in ("weight", "bias"):
+                attr = f"{param_key}_lowvram_function"
+                lowvram_function = getattr(module, attr, None)
+                if lowvram_function is not None:
+                    setattr(module, attr, None)
+                    functions = getattr(module, f"{param_key}_function", [])
+                    functions.append(lowvram_function)
+                    setattr(module, f"{param_key}_function", functions)
+
+    def clone(self, disable_dynamic=False, model_override=None):
+        if disable_dynamic:
+            if model_override is None:
+                fallback = self.cached_patcher_init[0](
+                    *self.cached_patcher_init[1],
+                    disable_dynamic=True,
+                )
+                model_override = fallback.get_clone_model_override()
+            return GGUFModelPatcher.clone(self, model_override=model_override)
+        return super().clone(disable_dynamic=disable_dynamic, model_override=model_override)
+
+
+class UnetLoaderGGUFDynamicVRAM(UnetLoaderGGUF):
+    TITLE = "Unet Loader (Dynamic VRAM)"
+
+    def load_unet(self, unet_name, **kwargs):
+        unet_path = folder_paths.get_full_path("unet", unet_name)
+        return (_load_dynamic_gguf_unet(unet_path),)
+
 class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
@@ -261,6 +351,55 @@ class CLIPLoaderGGUF:
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
 
+
+def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False):
+    if not disable_dynamic:
+        _require_dynamic_vram()
+    clip_data = []
+    for path in clip_paths:
+        if path.endswith(".gguf"):
+            clip_data.append(gguf_clip_loader(path, dynamic=not disable_dynamic))
+        else:
+            clip_data.append(comfy.utils.load_torch_file(path, safe_load=True))
+
+    model_options = {
+        "initial_device": comfy.model_management.text_encoder_offload_device(),
+    }
+    if disable_dynamic:
+        model_options["custom_operations"] = GGMLOps
+
+    clip = comfy.sd.load_text_encoder_state_dicts(
+        clip_type=clip_type,
+        state_dicts=clip_data,
+        model_options=model_options,
+        embedding_directory=folder_paths.get_folder_paths("embeddings"),
+        disable_dynamic=disable_dynamic,
+    )
+    clip.patcher = (
+        GGUFModelPatcher.clone(clip.patcher)
+        if disable_dynamic
+        else _clone_as_dynamic_gguf_patcher(clip.patcher)
+    )
+    clip.patcher.cached_patcher_init = (_load_dynamic_gguf_clip_patcher, (clip_paths, clip_type))
+    return clip
+
+
+def _load_dynamic_gguf_clip_patcher(clip_paths, clip_type, disable_dynamic=False):
+    return _load_dynamic_gguf_clip(
+        clip_paths,
+        clip_type,
+        disable_dynamic=disable_dynamic,
+    ).patcher
+
+
+class CLIPLoaderGGUFDynamicVRAM(CLIPLoaderGGUF):
+    TITLE = "CLIPLoader (Dynamic VRAM)"
+
+    def load_clip(self, clip_name, type="stable_diffusion"):
+        clip_path = folder_paths.get_full_path("clip", clip_name)
+        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+        return (_load_dynamic_gguf_clip([clip_path], clip_type),)
+
 class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
@@ -283,6 +422,18 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
 
+
+class DualCLIPLoaderGGUFDynamicVRAM(DualCLIPLoaderGGUF):
+    TITLE = "DualCLIPLoader (Dynamic VRAM)"
+
+    def load_clip(self, clip_name1, clip_name2, type):
+        clip_paths = (
+            folder_paths.get_full_path("clip", clip_name1),
+            folder_paths.get_full_path("clip", clip_name2),
+        )
+        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+        return (_load_dynamic_gguf_clip(clip_paths, clip_type),)
+
 class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
@@ -304,6 +455,19 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
         clip_paths = (clip_path1, clip_path2, clip_path3)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
+
+
+class TripleCLIPLoaderGGUFDynamicVRAM(TripleCLIPLoaderGGUF):
+    TITLE = "TripleCLIPLoader (Dynamic VRAM)"
+
+    def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
+        clip_paths = (
+            folder_paths.get_full_path("clip", clip_name1),
+            folder_paths.get_full_path("clip", clip_name2),
+            folder_paths.get_full_path("clip", clip_name3),
+        )
+        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+        return (_load_dynamic_gguf_clip(clip_paths, clip_type),)
 
 class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
@@ -329,6 +493,20 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
 
+
+class QuadrupleCLIPLoaderGGUFDynamicVRAM(QuadrupleCLIPLoaderGGUF):
+    TITLE = "QuadrupleCLIPLoader (Dynamic VRAM)"
+
+    def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion"):
+        clip_paths = (
+            folder_paths.get_full_path("clip", clip_name1),
+            folder_paths.get_full_path("clip", clip_name2),
+            folder_paths.get_full_path("clip", clip_name3),
+            folder_paths.get_full_path("clip", clip_name4),
+        )
+        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+        return (_load_dynamic_gguf_clip(clip_paths, clip_type),)
+
 NODE_CLASS_MAPPINGS = {
     "UnetLoaderGGUF": UnetLoaderGGUF,
     "CLIPLoaderGGUF": CLIPLoaderGGUF,
@@ -336,4 +514,9 @@ NODE_CLASS_MAPPINGS = {
     "TripleCLIPLoaderGGUF": TripleCLIPLoaderGGUF,
     "QuadrupleCLIPLoaderGGUF": QuadrupleCLIPLoaderGGUF,
     "UnetLoaderGGUFAdvanced": UnetLoaderGGUFAdvanced,
+    "UnetLoaderGGUFDynamicVRAM": UnetLoaderGGUFDynamicVRAM,
+    "CLIPLoaderGGUFDynamicVRAM": CLIPLoaderGGUFDynamicVRAM,
+    "DualCLIPLoaderGGUFDynamicVRAM": DualCLIPLoaderGGUFDynamicVRAM,
+    "TripleCLIPLoaderGGUFDynamicVRAM": TripleCLIPLoaderGGUFDynamicVRAM,
+    "QuadrupleCLIPLoaderGGUFDynamicVRAM": QuadrupleCLIPLoaderGGUFDynamicVRAM,
 }

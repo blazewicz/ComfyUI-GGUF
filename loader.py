@@ -6,8 +6,11 @@ import gguf
 import json
 import re
 import os
+import threading
+import comfy.memory_management
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
+from .quant_ops import make_quantized
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image", "ideogram", "krea2"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
@@ -25,6 +28,32 @@ def device_supports_bf16():
     except Exception:
         # If support can't be determined, keep the previous bf16 behavior.
         return True
+
+
+def dynamic_gguf_file_slice(path):
+    """
+    Create the file handle metadata used by DynamicVRAM to transfer a GGUF
+    tensor directly from its mmap-backed file to GPU memory.
+    """
+    if not comfy.memory_management.aimdo_enabled:
+        return None
+
+    import comfy_aimdo.model_mmap
+
+    model_mmap = comfy_aimdo.model_mmap.ModelMMAP(path)
+    return model_mmap, threading.Lock()
+
+
+def attach_dynamic_file_slice(torch_tensor, model_mmap, file_lock, offset, size):
+    storage = torch_tensor.untyped_storage()
+    storage._comfy_tensor_file_slice = comfy.memory_management.TensorFileSlice(
+        model_mmap.get_file_handle(),
+        file_lock,
+        offset,
+        size,
+    )
+    # Keep the native mmap alive for the storage lifetime.
+    storage._comfy_tensor_mmap_refs = (model_mmap,)
 
 def get_orig_shape(reader, tensor_name):
     field_key = f"comfy.gguf.orig_shape.{tensor_name}"
@@ -80,11 +109,12 @@ def get_gguf_metadata(reader):
             continue
     return metadata
 
-def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False):
+def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False, dynamic=False):
     """
     Read state dict as fake tensors
     """
     reader = gguf.GGUFReader(path)
+    dynamic_file_slice = dynamic_gguf_file_slice(path) if dynamic else None
 
     # filter and strip prefix
     has_prefix = False
@@ -125,6 +155,22 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     if compat:
         logging.warning(f"Warning: This gguf model file is loaded in compatibility mode '{compat}' [arch:{arch_str}]")
 
+    # Q8_CR weights must use ComfyUI's native TensorWiseINT8Layout rather than
+    # the generic GGML layout so DynamicVRAM retains native INT8 ConvRot kernels.
+    custom_quant_configs = {}
+    for field_name in reader.fields:
+        if field_name.startswith("comfy.gguf.quant."):
+            key = field_name[len("comfy.gguf.quant."):]
+            field = reader.get_field(field_name)
+            custom_quant_configs[key] = json.loads(str(field.parts[field.data[-1]], "utf-8"))
+
+    custom_quant_tensor_names = {
+        tensor_name
+        for key, quant_conf in custom_quant_configs.items()
+        if quant_conf.get("format") == "int8_tensorwise"
+        for tensor_name in (key, f"{key}_scale")
+    }
+
     # main loading loop
     # Devices without native bf16 fall back to slow fp32 compute, so load the
     # full-precision BF16 storage tensors as fp16 there instead.
@@ -139,6 +185,15 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
             torch_tensor = torch.from_numpy(tensor.data) # mmap
+        if dynamic_file_slice is not None:
+            model_mmap, file_lock = dynamic_file_slice
+            attach_dynamic_file_slice(
+                torch_tensor,
+                model_mmap,
+                file_lock,
+                tensor.data_offset,
+                tensor.n_bytes,
+            )
 
         shape = get_orig_shape(reader, tensor_name)
         if shape is None:
@@ -150,12 +205,26 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                         shape = shape[:-1]
 
         # add to state dict
-        if tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
+        if dynamic and sd_key not in custom_quant_tensor_names:
+            if tensor.tensor_type in {
+                gguf.GGMLQuantizationType.F32,
+                gguf.GGMLQuantizationType.F16,
+            }:
+                state_dict[sd_key] = torch_tensor.view(*shape)
+            elif tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
+                state_dict[sd_key] = torch_tensor.view(torch.bfloat16).reshape(shape).to(
+                    dtype=torch.float32 if len(shape) <= 1 else bf16_storage_dtype,
+                )
+            else:
+                state_dict[sd_key] = make_quantized(torch_tensor, tensor.tensor_type, shape)
+        elif tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
             torch_tensor = torch_tensor.view(*shape)
-        state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
+            state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
+        else:
+            state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
 
         # BF16 GGUF tensors are full-precision storage, not compressed quants.
-        if tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
+        if not dynamic and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
             dtype = torch.float32 if len(shape) <= 1 else bf16_storage_dtype
             state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=dtype)
 
@@ -185,7 +254,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             continue
         key = field_name[len("comfy.gguf.quant."):]
         field = reader.get_field(field_name)
-        quant_conf = json.loads(str(field.parts[field.data[-1]], "utf-8"))
+        quant_conf = custom_quant_configs[key]
         fmt = quant_conf.get("format")
 
         if fmt in {"int4_compact_gemm", "int4_pytorch"}:
@@ -215,20 +284,25 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                 quant_conf.pop("convrot_groupsize", None)
             elif quant_conf.get("convrot"):
                 groupsize = quant_conf.get("convrot_groupsize", 256)
-                if weight_ggml.tensor_shape[-1] % groupsize != 0:
+                weight_shape = weight_ggml.shape if dynamic else weight_ggml.tensor_shape
+                if weight_shape[-1] % groupsize != 0:
                     logging.warning(
                         "Disabling ConvRot for %s because %d input features are not "
                         "divisible by group size %d.",
                         weight_key,
-                        weight_ggml.tensor_shape[-1],
+                        weight_shape[-1],
                         groupsize,
                     )
                     quant_conf["convrot"] = False
                     quant_conf.pop("convrot_groupsize", None)
 
             # Convert to ComfyUI native state-dict layout
-            weight = weight_ggml.data.view(torch.int8).reshape(weight_ggml.tensor_shape)
-            scale = scale_ggml.data.view(torch.float32).reshape(scale_ggml.tensor_shape)
+            if dynamic:
+                weight = weight_ggml.view(torch.int8).reshape(weight_ggml.shape)
+                scale = scale_ggml.view(torch.float32).reshape(scale_ggml.shape)
+            else:
+                weight = weight_ggml.data.view(torch.int8).reshape(weight_ggml.tensor_shape)
+                scale = scale_ggml.data.view(torch.float32).reshape(scale_ggml.tensor_shape)
 
             state_dict[weight_key] = torch.nn.Parameter(weight, requires_grad=False)
             state_dict[scale_key] = torch.nn.Parameter(scale, requires_grad=False)
@@ -571,8 +645,8 @@ def gguf_gemma3_tokenizer_loader(path):
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
-def gguf_clip_loader(path):
-    sd, extra = gguf_sd_loader(path, is_text_model=True)
+def gguf_clip_loader(path, dynamic=False):
+    sd, extra = gguf_sd_loader(path, is_text_model=True, dynamic=dynamic)
     arch = extra.get("arch_str", None)
     if arch in {"t5", "t5encoder"}:
         temb_key = "token_embd.weight"
