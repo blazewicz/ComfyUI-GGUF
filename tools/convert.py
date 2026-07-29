@@ -6,6 +6,7 @@ import torch
 import logging
 import argparse
 from tqdm import tqdm
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 QUANTIZATION_THRESHOLD = 1024
@@ -19,6 +20,7 @@ class ModelTemplate:
     keys_detect = []  # list of lists to match in state dict
     keys_banned = []  # list of keys that should mark model as invalid for conversion
     keys_hiprec = []  # list of keys that need to be kept in fp32 for some reason
+    keys_noquant = [] # list of keys that must retain their source precision
     keys_ignore = []  # list of strings to ignore keys by when found
 
     def handle_nd_tensor(self, key, data):
@@ -111,10 +113,27 @@ class ModelLTXV(ModelTemplate):
             "adaln_single.emb.timestep_embedder.linear_2.weight",
             "transformer_blocks.27.scale_shift_table",
             "caption_projection.linear_2.weight",
-        )
+        ),
+        # LTX 2.3 audio-video checkpoints replace the video-only caption
+        # projection with audio/video connector modules.
+        (
+            "adaln_single.emb.timestep_embedder.linear_2.weight",
+            "transformer_blocks.27.scale_shift_table",
+            "audio_adaln_single.linear.weight",
+        ),
     ]
     keys_hiprec = [
-        "scale_shift_table" # nn.parameter, can't load from BF16 base quant
+        "scale_shift_table", # nn.Parameter, can't load from BF16 base quant
+        "learnable_registers", # Connector nn.Parameter, not a Linear weight
+    ]
+    # LTX's native INT8 ConvRot checkpoints intentionally leave these
+    # projections in BF16. The many 32-output gate logits are particularly
+    # small, so ConvRot dispatch overhead outweighs their INT8 benefit.
+    keys_noquant = [
+        "adaln_single",
+        "patchify_proj",
+        "proj_out",
+        "to_gate_logits",
     ]
 
 class ModelSDXL(ModelTemplate):
@@ -373,6 +392,12 @@ def load_state_dict(path):
 
     return strip_prefix(state_dict)
 
+def load_safetensors_metadata(path):
+    if not path.endswith(".safetensors"):
+        return {}
+    with safe_open(path, framework="pt", device="cpu") as checkpoint:
+        return checkpoint.metadata() or {}
+
 def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_name=None):
     # Pre-collect per-tensor FP8 scales (0-dim float32 tensors named "{key}_scale").
     # These must be applied to their FP8 weight tensors before GGUF quantization.
@@ -452,7 +477,9 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
             or old_dtype in _FP8_DTYPES
         )
         if apply_quantization_rules:
-            if n_dims == 1:
+            if any(x in key for x in model_arch.keys_noquant):
+                pass
+            elif n_dims == 1:
                 # One-dimensional tensors should be kept in F32.
                 data_qtype = gguf.GGMLQuantizationType.F32
             elif n_params <= QUANTIZATION_THRESHOLD:
@@ -509,6 +536,7 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
 def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type_name=None):
     # load & run model detection logic
     state_dict = load_state_dict(path)
+    source_metadata = load_safetensors_metadata(path)
     model_arch = detect_arch(state_dict)
     logging.info(f"* Architecture detected from input: {model_arch.arch}")
 
@@ -549,6 +577,8 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
     if ftype_gguf is not None:
         writer.add_file_type(ftype_gguf)
+    if "config" in source_metadata:
+        writer.add_string("config", source_metadata["config"])
 
     handle_tensors(writer, state_dict, model_arch, quant_type=quant_type, quant_type_name=quant_type_name)
     writer.write_header_to_file(path=dst_path)
