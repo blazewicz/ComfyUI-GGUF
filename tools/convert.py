@@ -26,6 +26,29 @@ class ModelTemplate:
     def handle_nd_tensor(self, key, data):
         raise NotImplementedError(f"Tensor detected that exceeds dims supported by C++ code! ({key} @ {data.shape})")
 
+def key_matches(key, patterns):
+    """
+    Match a tensor name against a list of patterns.
+
+    Plain patterns match anywhere in the key (today's behavior, unchanged --
+    e.g. "pos_embedder", "scale_shift_table", ".modulation").
+
+    A pattern prefixed with '^' matches only at the START of the key, e.g.
+    "^tmlp." matches "tmlp.0.weight" but NOT "blocks.5.txtmlp.0.weight" --
+    use this for short/generic fragments that would otherwise collide with
+    an unrelated, similarly-named submodule elsewhere in the tensor name
+    (see ModelKrea2: bare "tmlp."/"tproj." also matched every per-block
+    "txtmlp."/"txtproj." tensor, silently forcing far more of the model to
+    F32 than intended).
+    """
+    for pattern in patterns:
+        if pattern.startswith("^"):
+            if key.startswith(pattern[1:]):
+                return True
+        elif pattern in key:
+            return True
+    return False
+
 class ModelFlux(ModelTemplate):
     arch = "flux"
     keys_detect = [
@@ -209,10 +232,12 @@ class ModelKrea2(ModelTemplate):
         ),
     ]
     keys_hiprec = [
-        "blocks.0.mod.lin",  # modulation parameters — keep at full precision
-        "last.modulation.lin",
-        "tmlp.",
-        "tproj.",
+        "^first.",
+        "^last.",
+        "^tproj.",
+        "^tmlp.",
+        "^txtmlp.",
+        "^txtfusion.projector.",
     ]
 
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
@@ -223,10 +248,16 @@ def is_model_arch(model, state_dict):
     # check if model is correct
     matched = False
     invalid = False
-    for match_list in model.keys_detect:
+    for match_idx, match_list in enumerate(model.keys_detect):
         if all(key in state_dict for key in match_list):
             matched = True
             invalid = any(key in state_dict for key in model.keys_banned)
+            if len(model.keys_detect) > 1:
+                # Multiple detect variants usually mean multiple known checkpoint
+                # exports of the same architecture (e.g. different key subsets
+                # across releases). Logging which one matched makes it obvious
+                # which variant you're actually converting.
+                logging.info(f"* Matched keys_detect variant #{match_idx} for '{model.arch}': {match_list}")
             break
     assert not invalid, "Model architecture not allowed for conversion! (i.e. reference VS diffusers format)"
     return matched
@@ -239,6 +270,34 @@ def detect_arch(state_dict):
             break
     assert model_arch is not None, "Unknown model architecture!"
     return model_arch
+
+def validate_key_patterns(model_arch, state_dict):
+    """
+    Warn if a configured key pattern (keys_hiprec / keys_noquant / keys_ignore)
+    matches no tensor at all in this checkpoint.
+
+    These patterns are substring matches against tensor names (`any(x in key ...)`),
+    hand-written against one specific checkpoint export. If the upstream model
+    renames a layer in a later release, the pattern silently stops firing --
+    no error, no warning, just quietly reduced precision/behavior on tensors
+    that were meant to be protected. This check surfaces that case early,
+    at conversion time, instead of relying on someone noticing degraded output
+    later.
+
+    This is intentionally a warning, not an assert: a pattern legitimately
+    matching nothing can happen for known reasons too, e.g. a checkpoint
+    variant that simply doesn't include that sub-module (see ModelKrea2's
+    two keys_detect alternatives, which exist for exactly this reason).
+    """
+    for attr in ("keys_hiprec", "keys_noquant", "keys_ignore"):
+        for pattern in getattr(model_arch, attr, []):
+            if not any(key_matches(key, [pattern]) for key in state_dict.keys()):
+                logging.warning(
+                    f"[{model_arch.arch}] '{pattern}' in {attr} matched no tensor in this "
+                    f"checkpoint -- possible naming drift in the source model, or an "
+                    f"intentionally absent sub-module for this checkpoint variant. "
+                    f"Verify this is expected before trusting the output precision."
+                )
 
 QUANT_TYPE_MAP = {
     "F16":  (gguf.GGMLQuantizationType.F16,  gguf.LlamaFileType.MOSTLY_F16),
@@ -424,7 +483,7 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
     for key, data in tqdm(state_dict.items()):
         old_dtype = data.dtype
 
-        if any(x in key for x in model_arch.keys_ignore):
+        if key_matches(key, model_arch.keys_ignore):
             tqdm.write(f"Filtering ignored key: '{key}'")
             continue
 
@@ -477,15 +536,26 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
             or old_dtype in _FP8_DTYPES
         )
         if apply_quantization_rules:
-            if any(x in key for x in model_arch.keys_noquant):
-                pass
-            elif n_dims == 1:
-                # One-dimensional tensors should be kept in F32.
+            if n_dims == 1:
+                # One-dimensional tensors should be kept in F32. This is a
+                # universal safety net and must take priority over
+                # keys_noquant -- a broad keys_noquant prefix (e.g. Krea2's
+                # "^last.") would otherwise also match that submodule's 1D
+                # bias/scale tensors and silently downgrade them from the
+                # F32 they'd normally always get to whatever the generic
+                # default happens to be (F16/BF16).
                 data_qtype = gguf.GGMLQuantizationType.F32
             elif n_params <= QUANTIZATION_THRESHOLD:
                 data_qtype = gguf.GGMLQuantizationType.F32
-            elif any(x in key for x in model_arch.keys_hiprec):
+            elif key_matches(key, model_arch.keys_hiprec):
+                # More specific than keys_noquant by design: keys_hiprec
+                # forces F32 even when a broader keys_noquant pattern for
+                # the same submodule would also match (e.g. Krea2's
+                # "last.modulation.lin" needs full F32, even though the
+                # broader "^last." keys_noquant entry also matches it).
                 data_qtype = gguf.GGMLQuantizationType.F32
+            elif key_matches(key, model_arch.keys_noquant):
+                pass
             elif n_dims == 4 and "conv" in key.lower():
                 # Native quantized paths are Linear-only.
                 data_qtype = gguf.GGMLQuantizationType.F16
@@ -539,6 +609,7 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type
     source_metadata = load_safetensors_metadata(path)
     model_arch = detect_arch(state_dict)
     logging.info(f"* Architecture detected from input: {model_arch.arch}")
+    validate_key_patterns(model_arch, state_dict)
 
     # resolve quant type from name if provided
     quant_type = None
