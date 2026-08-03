@@ -168,5 +168,25 @@ Q8_CR does not require CUDA. It uses ComfyUI's `comfy_kitchen` layout backend:
 - CPU Q8_CR loading and inference are supported, but naturally slower than
   optimized CUDA inference.
 
+All GGUF UNET and CLIP loader nodes, including Dynamic VRAM and multi-CLIP
+variants, report their tensor-loading progress through ComfyUI's global
+progress bar. A multi-CLIP loader uses one bar for every selected file.
+
+### Target-size quantization
+
+Use `tools/convert.py --max-size-mb <MiB>` to create the best supported mixed
+quantization below a maximum output size. The converter starts with core 2-D
+Linear weights in Q8_CR while preserving 1-D and architecture-sensitive tensors
+in FP32. It then changes core matrices closest to the model's center to Q4_0
+until the target is met, retaining the beginning and end in Q8_CR for as long as
+possible. If every Q4_0-compatible core matrix is already Q4_0, ordinary 1-D
+tensors are reduced to BF16; protected tensors remain FP32.
+
+`Q4_0` is the smallest supported core quantization. A target below the minimum
+attainable size raises an error that reports that minimum; Q3 and lower are not
+used. The **Targeted Quantization (GGUF)** ComfyUI node exposes the same source,
+destination, quantization, target-size, and overwrite options, reports loading
+and conversion progress, and outputs both the GGUF path and output details.
+
 Reconvert any `Q8_CR` GGUF created before ConvRot weights were marked as
 pre-rotated. Older files load safely with native non-rotated INT8 instead.

@@ -345,6 +345,23 @@ def get_gguf_q8_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._full_precision_mm_config = False
 
             def _load_from_state_dict(self, *args):
+                state_dict, prefix = args[:2]
+                weight_key = f"{prefix}weight"
+                # Target-size GGUFs combine native Q8_CR weights with standard
+                # Q4_0 weights. The mixed-precision loader only understands
+                # the former's comfy_quant metadata, so materialize standard
+                # GGML weights before handing them to that loader.
+                if weight_key in state_dict and f"{prefix}comfy_quant" not in state_dict:
+                    weight = state_dict[weight_key]
+                    if is_quantized(weight):
+                        state_dict[weight_key] = dequantize_tensor(
+                            weight,
+                            dtype=self.factory_kwargs["dtype"],
+                        )
+                    elif hasattr(weight, "dequantize"):
+                        state_dict[weight_key] = weight.dequantize().to(
+                            dtype=self.factory_kwargs["dtype"],
+                        )
                 return comfy.ops._load_quantized_module(
                     self,
                     torch.nn.Module._load_from_state_dict.__get__(self, type(self)),

@@ -3,6 +3,7 @@ import torch
 import logging
 import inspect
 import collections
+import os
 
 import nodes
 import comfy.sd
@@ -15,8 +16,9 @@ import comfy.memory_management
 import folder_paths
 
 from .ops import GGMLOps, get_gguf_q8_ops, move_patch_to_device
-from .loader import gguf_sd_loader, gguf_clip_loader
+from .loader import gguf_sd_loader, gguf_clip_loader, gguf_tensor_count
 from .dequant import is_quantized, is_torch_compatible
+from .tools.convert import QUANT_TYPE_MAP, TARGET_SIZE_QUANT_TYPE, convert_file
 
 def update_folder_names_and_paths(key, targets=[]):
     # check for existing key
@@ -32,6 +34,32 @@ def update_folder_names_and_paths(key, targets=[]):
 # Add a custom keys for files ending in .gguf
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
+
+
+class GGUFLoadProgress:
+    """Coordinate one ComfyUI progress bar across one or more model files."""
+
+    def __init__(self, paths):
+        self.path_totals = {
+            path: gguf_tensor_count(path) if path.endswith(".gguf") else 1
+            for path in paths
+        }
+        self.total = sum(self.path_totals.values())
+        self.pbar = comfy.utils.ProgressBar(self.total)
+        self.completed = 0
+
+    def callback_for(self, path):
+        offset = self.completed
+        total = self.path_totals[path]
+
+        def update(current, _loader_total):
+            self.pbar.update_absolute(offset + current, self.total)
+
+        return update
+
+    def complete_file(self, path):
+        self.completed += self.path_totals[path]
+        self.pbar.update_absolute(self.completed, self.total)
 
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     patch_on_device = False
@@ -150,7 +178,9 @@ class UnetLoaderGGUF:
 
     def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
         unet_path = folder_paths.get_full_path("unet", unet_name)
-        sd, extra = gguf_sd_loader(unet_path)
+        progress = GGUFLoadProgress([unet_path])
+        sd, extra = gguf_sd_loader(unet_path, progress_callback=progress.callback_for(unet_path))
+        progress.complete_file(unet_path)
 
         mode = extra.get("gguf_quant_mode")
         if mode == "int8_convrot":
@@ -196,6 +226,98 @@ class UnetLoaderGGUF:
         return (model,)
 
 
+class TargetedQuantizationGGUF:
+    """Convert a source checkpoint to GGUF from a ComfyUI workflow."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "source_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Absolute path to a .safetensors, .ckpt, .pt, .bin, or .pth source model.",
+                    },
+                ),
+                "destination_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Output .gguf path. Leave empty to derive it from the source path.",
+                    },
+                ),
+                "quantization": (
+                    [TARGET_SIZE_QUANT_TYPE, *QUANT_TYPE_MAP.keys()],
+                    {
+                        "default": TARGET_SIZE_QUANT_TYPE,
+                        "tooltip": (
+                            "TARGET_SIZE starts at Q8_CR, reduces central core matrices to Q4_0, "
+                            "then ordinary 1-D tensors to BF16 only when necessary."
+                        ),
+                    },
+                ),
+                "max_size_mb": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1000000.0,
+                        "step": 1.0,
+                        "tooltip": "Maximum output size in MiB. Required only for TARGET_SIZE.",
+                    },
+                ),
+                "overwrite": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("gguf_path", "quantization_info")
+    FUNCTION = "quantize"
+    CATEGORY = "bootleg/quantization"
+    TITLE = "Targeted Quantization (GGUF)"
+
+    def quantize(self, source_path, destination_path, quantization, max_size_mb, overwrite):
+        source_path = os.path.abspath(os.path.expanduser(source_path))
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"Source model does not exist: {source_path}")
+
+        if quantization == TARGET_SIZE_QUANT_TYPE and max_size_mb <= 0:
+            raise ValueError("TARGET_SIZE requires max_size_mb greater than zero.")
+
+        progress = {"bar": None, "read_total": None, "total": None}
+
+        def report_progress(stage, current, total):
+            if stage == "read":
+                if progress["bar"] is None:
+                    progress["read_total"] = total
+                    progress["total"] = total * 2 + 1
+                    progress["bar"] = comfy.utils.ProgressBar(progress["total"])
+                progress["bar"].update_absolute(current, progress["total"])
+            elif stage == "quantize":
+                if progress["bar"] is None:
+                    progress["read_total"] = 0
+                    progress["total"] = total + 1
+                    progress["bar"] = comfy.utils.ProgressBar(progress["total"])
+                progress["bar"].update_absolute(progress["read_total"] + current, progress["total"])
+
+        output_path, _ = convert_file(
+            source_path,
+            dst_path=destination_path or None,
+            interact=False,
+            overwrite=overwrite,
+            quant_type_name=None if quantization == TARGET_SIZE_QUANT_TYPE else quantization,
+            max_size_mb=max_size_mb if quantization == TARGET_SIZE_QUANT_TYPE else None,
+            progress_callback=report_progress,
+        )
+        if progress["bar"] is not None:
+            progress["bar"].update_absolute(progress["total"], progress["total"])
+
+        output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        info = f"{quantization}: {output_size_mb:.2f} MiB written to {output_path}"
+        return (output_path, info)
+
+
 def _require_dynamic_vram():
     if not comfy.memory_management.aimdo_enabled:
         raise RuntimeError(
@@ -224,17 +346,27 @@ def _legacy_gguf_ops(extra):
     return GGMLOps()
 
 
-def _load_dynamic_gguf_unet(unet_path, disable_dynamic=False):
+def _load_dynamic_gguf_unet(unet_path, disable_dynamic=False, progress=None):
     if not disable_dynamic:
         _require_dynamic_vram()
-    sd, extra = gguf_sd_loader(unet_path, dynamic=not disable_dynamic)
+    progress = progress or GGUFLoadProgress([unet_path])
+    sd, extra = gguf_sd_loader(
+        unet_path,
+        dynamic=not disable_dynamic,
+        progress_callback=progress.callback_for(unet_path),
+    )
+    progress.complete_file(unet_path)
 
     kwargs = {}
     valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters
     if "metadata" in valid_params:
         kwargs["metadata"] = extra.get("metadata", {})
 
-    model_options = {} if not disable_dynamic else {
+    # Target-size models combine native Q8_CR layers with standard GGML Q4_0
+    # layers. Dynamic VRAM's default mixed-precision Linear cannot serialize a
+    # bare GGML Q4_0 weight, so use the GGUF Q8 ops for both paths. Those ops
+    # retain Q8_CR metadata and materialize only standard GGML layers as needed.
+    model_options = {
         "custom_operations": _legacy_gguf_ops(extra),
     }
     model = comfy.sd.load_diffusion_model_state_dict(
@@ -282,7 +414,7 @@ class UnetLoaderGGUFDynamicVRAM(UnetLoaderGGUF):
 
     def load_unet(self, unet_name, **kwargs):
         unet_path = folder_paths.get_full_path("unet", unet_name)
-        return (_load_dynamic_gguf_unet(unet_path),)
+        return (_load_dynamic_gguf_unet(unet_path, progress=GGUFLoadProgress([unet_path])),)
 
 class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
     @classmethod
@@ -323,14 +455,16 @@ class CLIPLoaderGGUF:
 
     def load_data(self, ckpt_paths):
         clip_data = []
+        progress = GGUFLoadProgress(ckpt_paths)
         for p in ckpt_paths:
             if p.endswith(".gguf"):
-                sd = gguf_clip_loader(p)
+                sd = gguf_clip_loader(p, progress_callback=progress.callback_for(p))
             else:
                 sd = comfy.utils.load_torch_file(p, safe_load=True)
                 if "scaled_fp8" in sd: # NOTE: Scaled FP8 would require different custom ops, but only one can be active
                     raise NotImplementedError(f"Mixing scaled FP8 with GGUF is not supported! Use regular CLIP loader or switch model(s)\n({p})")
             clip_data.append(sd)
+            progress.complete_file(p)
         return clip_data
 
     def load_patcher(self, clip_paths, clip_type, clip_data):
@@ -352,15 +486,23 @@ class CLIPLoaderGGUF:
         return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
 
 
-def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False):
+def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False, progress=None):
     if not disable_dynamic:
         _require_dynamic_vram()
+    progress = progress or GGUFLoadProgress(clip_paths)
     clip_data = []
     for path in clip_paths:
         if path.endswith(".gguf"):
-            clip_data.append(gguf_clip_loader(path, dynamic=not disable_dynamic))
+            clip_data.append(
+                gguf_clip_loader(
+                    path,
+                    dynamic=not disable_dynamic,
+                    progress_callback=progress.callback_for(path),
+                )
+            )
         else:
             clip_data.append(comfy.utils.load_torch_file(path, safe_load=True))
+        progress.complete_file(path)
 
     model_options = {
         "initial_device": comfy.model_management.text_encoder_offload_device(),
@@ -398,7 +540,7 @@ class CLIPLoaderGGUFDynamicVRAM(CLIPLoaderGGUF):
     def load_clip(self, clip_name, type="stable_diffusion"):
         clip_path = folder_paths.get_full_path("clip", clip_name)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (_load_dynamic_gguf_clip([clip_path], clip_type),)
+        return (_load_dynamic_gguf_clip([clip_path], clip_type, progress=GGUFLoadProgress([clip_path])),)
 
 class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
@@ -508,6 +650,7 @@ class QuadrupleCLIPLoaderGGUFDynamicVRAM(QuadrupleCLIPLoaderGGUF):
         return (_load_dynamic_gguf_clip(clip_paths, clip_type),)
 
 NODE_CLASS_MAPPINGS = {
+    "TargetedQuantizationGGUF": TargetedQuantizationGGUF,
     "UnetLoaderGGUF": UnetLoaderGGUF,
     "CLIPLoaderGGUF": CLIPLoaderGGUF,
     "DualCLIPLoaderGGUF": DualCLIPLoaderGGUF,

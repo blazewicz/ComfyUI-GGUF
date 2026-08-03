@@ -109,7 +109,11 @@ def get_gguf_metadata(reader):
             continue
     return metadata
 
-def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False, dynamic=False):
+def gguf_tensor_count(path):
+    return len(gguf.GGUFReader(path).tensors)
+
+
+def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False, dynamic=False, progress_callback=None):
     """
     Read state dict as fake tensors
     """
@@ -177,7 +181,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     bf16_storage_dtype = torch.bfloat16 if device_supports_bf16() else torch.float16
     state_dict = {}
     qtype_dict = {}
-    for sd_key, tensor in tensors:
+    for tensor_index, (sd_key, tensor) in enumerate(tensors, start=1):
         tensor_name = tensor.name
         # torch_tensor = torch.from_numpy(tensor.data) # mmap
 
@@ -231,6 +235,8 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
         qtype_dict[tensor_type_str] = qtype_dict.get(tensor_type_str, 0) + 1
+        if progress_callback is not None:
+            progress_callback(tensor_index, len(tensors))
 
     # print loaded tensor type counts
     logging.info("gguf qtypes: " + ", ".join(f"{k} ({v})" for k, v in qtype_dict.items()))
@@ -645,8 +651,13 @@ def gguf_gemma3_tokenizer_loader(path):
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
-def gguf_clip_loader(path, dynamic=False):
-    sd, extra = gguf_sd_loader(path, is_text_model=True, dynamic=dynamic)
+def gguf_clip_loader(path, dynamic=False, progress_callback=None):
+    sd, extra = gguf_sd_loader(
+        path,
+        is_text_model=True,
+        dynamic=dynamic,
+        progress_callback=progress_callback,
+    )
     arch = extra.get("arch_str", None)
     if arch in {"t5", "t5encoder"}:
         temb_key = "token_embd.weight"

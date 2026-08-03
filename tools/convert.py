@@ -7,7 +7,7 @@ import logging
 import argparse
 from tqdm import tqdm
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 QUANTIZATION_THRESHOLD = 1024
 REARRANGE_THRESHOLD = 512
@@ -312,6 +312,132 @@ QUANT_TYPE_MAP = {
     # "Q4_PT": (gguf.GGMLQuantizationType.I8, None),
 }
 
+TARGET_SIZE_QUANT_TYPE = "TARGET_SIZE"
+MEBIBYTE = 1024 * 1024
+
+
+def _tensor_size_bytes(shape, quant_type):
+    """Return the GGUF payload size for a tensor with the given quantization."""
+    n_params = 1
+    for dim_size in shape:
+        n_params *= dim_size
+
+    if quant_type == gguf.GGMLQuantizationType.I8:
+        return n_params
+
+    block_size, type_size = gguf.constants.GGML_QUANT_SIZES[quant_type]
+    if n_params % block_size:
+        raise ValueError(
+            f"{quant_type.name} requires a tensor size divisible by {block_size}, "
+            f"got shape {tuple(shape)} ({n_params} elements)."
+        )
+    return n_params // block_size * type_size
+
+
+def _default_qtype(data_or_dtype):
+    return (
+        gguf.GGMLQuantizationType.BF16
+        if getattr(data_or_dtype, "dtype", data_or_dtype) == torch.bfloat16
+        else gguf.GGMLQuantizationType.F16
+    )
+
+
+def _is_target_core_tensor(key, data, model_arch):
+    if len(data.shape) != 2:
+        return False
+    if data.numel() <= QUANTIZATION_THRESHOLD:
+        return False
+    if key_matches(key, model_arch.keys_hiprec) or key_matches(key, model_arch.keys_noquant):
+        return False
+    return True
+
+
+def _can_use_q4_0(data):
+    block_size, _ = gguf.constants.GGML_QUANT_SIZES[gguf.GGMLQuantizationType.Q4_0]
+    return data.shape[-1] % block_size == 0
+
+
+def plan_target_size_quantization(state_dict, model_arch, max_size_mb):
+    """
+    Select per-tensor types that fit a maximum serialized payload size.
+
+    Core 2-D tensors start in Q8_CR. The center of their checkpoint order is
+    downgraded first, leaving the beginning and end at Q8_CR as long as possible.
+    Once every Q4-compatible core tensor is Q4_0, ordinary 1-D tensors may be
+    reduced to BF16. Protected tensors always remain F32.
+    """
+    if max_size_mb <= 0:
+        raise ValueError("--max-size-mb must be greater than zero.")
+
+    plan = {}
+    core_tensors = []
+    one_dimensional_tensors = []
+
+    for key, data in state_dict.items():
+        if key_matches(key, model_arch.keys_ignore):
+            continue
+        if key.endswith(".comfy_quant") or key.endswith("_scale") and len(data.shape) == 0:
+            continue
+        if len(data.shape) == 0 or len(data.shape) > MAX_TENSOR_DIMS:
+            continue
+
+        n_params = data.numel()
+        if len(data.shape) == 1 or n_params <= QUANTIZATION_THRESHOLD or key_matches(key, model_arch.keys_hiprec):
+            plan[key] = gguf.GGMLQuantizationType.F32
+            if len(data.shape) == 1 and not key_matches(key, model_arch.keys_hiprec):
+                one_dimensional_tensors.append((key, data))
+        elif key_matches(key, model_arch.keys_noquant):
+            plan[key] = _default_qtype(data)
+        elif len(data.shape) == 4 and "conv" in key.lower():
+            plan[key] = gguf.GGMLQuantizationType.F16
+        elif _is_target_core_tensor(key, data, model_arch):
+            plan[key] = gguf.GGMLQuantizationType.I8
+            if _can_use_q4_0(data):
+                core_tensors.append((key, data))
+        else:
+            plan[key] = _default_qtype(data)
+
+    def plan_size():
+        total = 0
+        for key, data in state_dict.items():
+            if key not in plan:
+                continue
+            qtype = plan[key]
+            total += _tensor_size_bytes(data.shape, qtype)
+            if qtype == gguf.GGMLQuantizationType.I8:
+                # Q8_CR stores a F32 scale for every output row.
+                total += data.shape[0] * 4
+        return total
+
+    target_size = int(max_size_mb * MEBIBYTE)
+    maximum_size = plan_size()
+    if maximum_size <= target_size:
+        return plan, maximum_size, maximum_size
+
+    center = (len(core_tensors) - 1) / 2
+    for index, (key, _) in sorted(
+        enumerate(core_tensors),
+        key=lambda item: (abs(item[0] - center), item[0]),
+    ):
+        plan[key] = gguf.GGMLQuantizationType.Q4_0
+        current_size = plan_size()
+        if current_size <= target_size:
+            return plan, maximum_size, current_size
+
+    for key, _ in one_dimensional_tensors:
+        plan[key] = gguf.GGMLQuantizationType.BF16
+        current_size = plan_size()
+        if current_size <= target_size:
+            return plan, maximum_size, current_size
+
+    minimum_size = plan_size()
+    raise ValueError(
+        f"Cannot shrink this model to {max_size_mb:g} MiB. "
+        f"The smallest supported TARGET_SIZE output is {minimum_size / MEBIBYTE:.2f} MiB "
+        f"(all Q4_0-compatible core matrices at Q4_0 and ordinary 1-D tensors at BF16). "
+        "Q3 and lower quantization are not supported."
+    )
+
 
 def quantize_int8_convrot(weight, convrot_groupsize=256):
     """
@@ -400,6 +526,16 @@ def parse_args():
         help="Target quantization type for eligible 2-D+ tensors "
              "(1-D biases/scales stay F32). Defaults to F16/BF16 matching the source dtype.",
     )
+    parser.add_argument(
+        "--max-size-mb",
+        type=float,
+        default=None,
+        help=(
+            "Maximum output payload size in MiB. Selects TARGET_SIZE quantization: "
+            "Q8_CR core weights are progressively changed to Q4_0 from the model "
+            "center outward, then ordinary 1-D tensors to BF16 if necessary."
+        ),
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.src):
@@ -437,9 +573,13 @@ def strip_prefix(state_dict):
 
     return sd
 
-def load_state_dict(path):
+def load_state_dict(path, progress_callback=None):
     if any(path.endswith(x) for x in [".ckpt", ".pt", ".bin", ".pth"]):
-        state_dict = torch.load(path, map_location="cpu", weights_only=True)
+        with tqdm(total=1, desc="Reading checkpoint", unit="file") as progress:
+            state_dict = torch.load(path, map_location="cpu", weights_only=True)
+            progress.update()
+        if progress_callback is not None:
+            progress_callback("read", 1, 1)
         for subkey in ["model", "module"]:
             if subkey in state_dict:
                 state_dict = state_dict[subkey]
@@ -447,7 +587,13 @@ def load_state_dict(path):
         if len(state_dict) < 20:
             raise RuntimeError(f"pt subkey load failed: {state_dict.keys()}")
     else:
-        state_dict = load_file(path)
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            keys = list(checkpoint.keys())
+            state_dict = {}
+            for index, key in enumerate(tqdm(keys, desc="Reading tensors", unit="tensor"), start=1):
+                state_dict[key] = checkpoint.get_tensor(key)
+                if progress_callback is not None:
+                    progress_callback("read", index, len(keys))
 
     return strip_prefix(state_dict)
 
@@ -457,7 +603,7 @@ def load_safetensors_metadata(path):
     with safe_open(path, framework="pt", device="cpu") as checkpoint:
         return checkpoint.metadata() or {}
 
-def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_name=None):
+def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_name=None, quantization_plan=None, progress_callback=None):
     # Pre-collect per-tensor FP8 scales (0-dim float32 tensors named "{key}_scale").
     # These must be applied to their FP8 weight tensors before GGUF quantization.
     # The actual weight value is fp8_value * scale; ignoring scale produces wrong magnitudes.
@@ -480,7 +626,7 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
     if max_name_len > MAX_TENSOR_NAME_LENGTH:
         bad_list = ", ".join(f"{key!r} ({namelen})" for key, namelen in name_lengths if namelen > MAX_TENSOR_NAME_LENGTH)
         raise ValueError(f"Can only handle tensor names up to {MAX_TENSOR_NAME_LENGTH} characters. Tensors exceeding the limit: {bad_list}")
-    for key, data in tqdm(state_dict.items()):
+    for tensor_index, (key, data) in enumerate(tqdm(state_dict.items()), start=1):
         old_dtype = data.dtype
 
         if key_matches(key, model_arch.keys_ignore):
@@ -513,12 +659,7 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
 
         n_dims = len(data.shape)
         data_shape = data.shape
-        if old_dtype == torch.bfloat16:
-            data_qtype = gguf.GGMLQuantizationType.BF16
-        # elif old_dtype == torch.float32:
-        #     data_qtype = gguf.GGMLQuantizationType.F32
-        else:
-            data_qtype = gguf.GGMLQuantizationType.F16
+        data_qtype = _default_qtype(old_dtype)
 
         # The max no. of dimensions that can be handled by the quantization code is 4.
         if n_dims > MAX_TENSOR_DIMS:
@@ -535,7 +676,9 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
             or old_dtype in (torch.float32, torch.bfloat16)
             or old_dtype in _FP8_DTYPES
         )
-        if apply_quantization_rules:
+        if quantization_plan is not None and key in quantization_plan:
+            data_qtype = quantization_plan[key]
+        elif apply_quantization_rules:
             if n_dims == 1:
                 # One-dimensional tensors should be kept in F32. This is a
                 # universal safety net and must take priority over
@@ -569,13 +712,14 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
         # retired_quantize_int4_pytorch and are intentionally not selectable.
 
         # Q8_CR is the supported custom quantization path.
-        if quant_type_name == "Q8_CR" and data_qtype == quant_type and n_dims == 2:
-            if quant_type_name == "Q8_CR":
-                qdata, scale, quant_conf, orig_shape = quantize_int8_convrot(torch.from_numpy(data))
-                writer.add_tensor(key, qdata.numpy(), raw_dtype=gguf.GGMLQuantizationType.I8)
-                writer.add_tensor(f"{key}_scale", scale.numpy(), raw_dtype=gguf.GGMLQuantizationType.F32)
-                writer.add_string(f"comfy.gguf.quant.{key}", json.dumps(quant_conf))
-                continue
+        if data_qtype == gguf.GGMLQuantizationType.I8 and n_dims == 2:
+            qdata, scale, quant_conf, orig_shape = quantize_int8_convrot(torch.from_numpy(data))
+            writer.add_tensor(key, qdata.numpy(), raw_dtype=gguf.GGMLQuantizationType.I8)
+            writer.add_tensor(f"{key}_scale", scale.numpy(), raw_dtype=gguf.GGMLQuantizationType.F32)
+            writer.add_string(f"comfy.gguf.quant.{key}", json.dumps(quant_conf))
+            if progress_callback is not None:
+                progress_callback("quantize", tensor_index, len(state_dict))
+            continue
 
             # Q4_PT emission is retired with its runtime backend.
 
@@ -602,18 +746,38 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
         tqdm.write(f"{f'%-{max_name_len + 4}s' % f'{new_name}'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
 
         writer.add_tensor(new_name, data, raw_dtype=data_qtype)
+        if progress_callback is not None:
+            progress_callback("quantize", tensor_index, len(state_dict))
 
-def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type_name=None):
+def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type_name=None, max_size_mb=None, progress_callback=None):
     # load & run model detection logic
-    state_dict = load_state_dict(path)
+    state_dict = load_state_dict(path, progress_callback=progress_callback)
     source_metadata = load_safetensors_metadata(path)
     model_arch = detect_arch(state_dict)
     logging.info(f"* Architecture detected from input: {model_arch.arch}")
     validate_key_patterns(model_arch, state_dict)
 
+    if max_size_mb is not None and quant_type_name not in (None, TARGET_SIZE_QUANT_TYPE):
+        raise ValueError("--max-size-mb cannot be combined with --quant-type.")
+
+    quantization_plan = None
+    if max_size_mb is not None:
+        quant_type_name = TARGET_SIZE_QUANT_TYPE
+        quantization_plan, maximum_size, selected_size = plan_target_size_quantization(
+            state_dict, model_arch, max_size_mb
+        )
+        logging.info(
+            "TARGET_SIZE selected %.2f MiB from a Q8_CR baseline of %.2f MiB.",
+            selected_size / MEBIBYTE,
+            maximum_size / MEBIBYTE,
+        )
+
     # resolve quant type from name if provided
     quant_type = None
-    if quant_type_name is not None and quant_type_name in QUANT_TYPE_MAP:
+    if quantization_plan is not None:
+        ftype_name = TARGET_SIZE_QUANT_TYPE
+        ftype_gguf = None
+    elif quant_type_name is not None and quant_type_name in QUANT_TYPE_MAP:
         quant_type, ftype_gguf = QUANT_TYPE_MAP[quant_type_name]
         ftype_name = quant_type_name
     else:
@@ -651,7 +815,15 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type
     if "config" in source_metadata:
         writer.add_string("config", source_metadata["config"])
 
-    handle_tensors(writer, state_dict, model_arch, quant_type=quant_type, quant_type_name=quant_type_name)
+    handle_tensors(
+        writer,
+        state_dict,
+        model_arch,
+        quant_type=quant_type,
+        quant_type_name=quant_type_name,
+        quantization_plan=quantization_plan,
+        progress_callback=progress_callback,
+    )
     writer.write_header_to_file(path=dst_path)
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
@@ -666,4 +838,4 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type
 
 if __name__ == "__main__":
     args = parse_args()
-    convert_file(args.src, args.dst, quant_type_name=args.quant_type)
+    convert_file(args.src, args.dst, quant_type_name=args.quant_type, max_size_mb=args.max_size_mb)
