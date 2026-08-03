@@ -27,4 +27,4 @@ Documentation = "https://github.com/molbal/ComfyUI-GGUF#readme"
 [tool.comfy]
 PublisherId = "molbal"
 DisplayName = "ComfyUI GGUF (molbal's fork)"
-Icon = ""
+Icon = "https://raw.githubusercontent.com/molbal/ComfyUI-GGUF/refs/heads/main/icon.png"
