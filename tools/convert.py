@@ -240,9 +240,25 @@ class ModelKrea2(ModelTemplate):
         "^txtfusion.projector.",
     ]
 
+
+class ModelMinimaxH3(ModelTemplate):
+    arch = "minimax_h3"
+    keys_detect = [
+        (
+            "video_patch_proj.weight",
+            "audio_patch_proj.weight",
+            "blocks.0.attn.qkv_proj.weight",
+            "final_layer.video_out.weight",
+        )
+    ]
+    # This is a model buffer used to interpolate timestep embeddings, rather
+    # than a Linear weight. Keep it in FP32 for the native interpolation path.
+    keys_hiprec = ["adaln_t_table"]
+
+
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
              ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
-             ModelKrea2, ModelIdeogram]
+             ModelKrea2, ModelIdeogram, ModelMinimaxH3]
 
 def is_model_arch(model, state_dict):
     # check if model is correct
