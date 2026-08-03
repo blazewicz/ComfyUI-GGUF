@@ -47,7 +47,7 @@ from convert import convert_file, QUANT_TYPE_MAP  # noqa: E402  (tools/convert.p
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-DEFAULT_QUANTS = ["Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0"]
+DEFAULT_QUANTS = ["Q4_0", "Q8_CR", "Q8_0"]
 
 
 def build_dst_path(src: str, quant: str, outdir: str | None) -> str:

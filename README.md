@@ -3,7 +3,7 @@ GGUF Quantization support for native ComfyUI models including the custom Q8_CR
 
 > [!NOTE]  
 > This is a fork of the original nodes, updated to support loading Ideogram 4 GGUFs and Krea 2 GGUFs. 
-> To use it, clone `https://github.com/city96/ComfyUI-GGUF`and not the original repo.
+> To use this maintained fork, clone `https://github.com/molbal/ComfyUI-GGUF`.
 
 While quantization wasn't feasible for regular UNET models (conv2d), transformer/DiT models such as flux seem less affected by quantization. This allows running it in much lower bits per weight variable bitrate quants on low-end GPUs. For further VRAM savings, a node to load a quantized version of the T5 text encoder is also included.
 
@@ -167,10 +167,6 @@ Q8_CR does not require CUDA. It uses ComfyUI's `comfy_kitchen` layout backend:
 - Linux and non-CUDA environments use the `comfy_kitchen` eager backend.
 - CPU Q8_CR loading and inference are supported, but naturally slower than
   optimized CUDA inference.
-
-Q4_PT is retired from conversion and loading until a performant W4A16 backend
-is available. Its experimental implementation remains in the source for future
-work, but it is no longer selectable or loadable.
 
 Reconvert any `Q8_CR` GGUF created before ConvRot weights were marked as
 pre-rotated. Older files load safely with native non-rotated INT8 instead.
