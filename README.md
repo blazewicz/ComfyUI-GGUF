@@ -53,9 +53,10 @@ Initial support for quantizing T5 has also been added recently, these can be use
 
 See the instructions in the [tools](https://github.com/city96/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants.
 
-## Converting Krea 2 and Ideogram 4 models
+## Converting Krea 2, Ideogram 4, and Minimax M3 models
 
-The converter detects supported Krea 2 and Ideogram 4 checkpoints directly.
+The converter detects supported Krea 2, Ideogram 4, and native Minimax M3
+(`minimax_h3`) checkpoints directly.
 Provide an existing `.safetensors`, `.ckpt`, `.pt`, `.pth`, or `.bin` diffusion
 model file; no model-specific conversion script is required.
 
@@ -74,6 +75,13 @@ python tools/convert.py --src /path/to/krea2_or_ideogram.safetensors \
 # Recommended for RTX 30-series NVIDIA GPUs
 python tools/convert.py --src /path/to/krea2_or_ideogram.safetensors \
   --dst /path/to/model-Q8_CR.gguf --quant-type Q8_CR
+```
+
+For a native Minimax M3 checkpoint, use the same command:
+
+```bash
+python tools/convert.py --src /path/to/minimax_m3.safetensors \
+  --dst /path/to/minimax_m3-Q8_CR.gguf --quant-type Q8_CR
 ```
 
 For the portable Windows distribution, use its embedded Python executable:
