@@ -18,7 +18,14 @@ import folder_paths
 from .ops import GGMLOps, get_gguf_q8_ops, move_patch_to_device
 from .loader import gguf_sd_loader, gguf_clip_loader, gguf_tensor_count
 from .dequant import is_quantized, is_torch_compatible
-from .tools.convert import QUANT_TYPE_MAP, TARGET_SIZE_QUANT_TYPE, convert_file
+from .tools.convert import (
+    DEFAULT_TARGET_SIZE_Q8_TYPE,
+    QUANT_TYPE_MAP,
+    QUANTIZATION_DEVICE_OPTIONS,
+    TARGET_SIZE_Q8_TYPES,
+    TARGET_SIZE_QUANT_TYPE,
+    convert_file,
+)
 
 def update_folder_names_and_paths(key, targets=[]):
     # check for existing key
@@ -252,8 +259,8 @@ class TargetedQuantizationGGUF:
                     {
                         "default": TARGET_SIZE_QUANT_TYPE,
                         "tooltip": (
-                            "TARGET_SIZE starts at Q8_CR, reduces central core matrices to Q4_0, "
-                            "then ordinary 1-D tensors to BF16 only when necessary."
+                            "TARGET_SIZE starts at the selected Q8 type, reduces central core matrices "
+                            "to Q5_0 then Q4_0, then ordinary 1-D tensors to BF16 only when necessary."
                         ),
                     },
                 ),
@@ -267,6 +274,26 @@ class TargetedQuantizationGGUF:
                         "tooltip": "Maximum output size in MiB. Required only for TARGET_SIZE.",
                     },
                 ),
+                "target_size_q8_type": (
+                    list(TARGET_SIZE_Q8_TYPES),
+                    {
+                        "default": DEFAULT_TARGET_SIZE_Q8_TYPE,
+                        "tooltip": (
+                            "TARGET_SIZE baseline: Q8_CR uses native INT8 ConvRot; "
+                            "Q8_0 uses standard GGUF Q8 before layers are reduced to Q4_0."
+                        ),
+                    },
+                ),
+                "quantization_device": (
+                    list(QUANTIZATION_DEVICE_OPTIONS),
+                    {
+                        "default": "auto",
+                        "tooltip": (
+                            "Q8_CR conversion device. auto uses CUDA when available and "
+                            "falls back to CPU per matrix when VRAM is insufficient."
+                        ),
+                    },
+                ),
                 "overwrite": ("BOOLEAN", {"default": False}),
             },
         }
@@ -277,7 +304,16 @@ class TargetedQuantizationGGUF:
     CATEGORY = "bootleg/quantization"
     TITLE = "Targeted Quantization (GGUF)"
 
-    def quantize(self, source_path, destination_path, quantization, max_size_mb, overwrite):
+    def quantize(
+        self,
+        source_path,
+        destination_path,
+        quantization,
+        max_size_mb,
+        target_size_q8_type,
+        quantization_device,
+        overwrite,
+    ):
         source_path = os.path.abspath(os.path.expanduser(source_path))
         if not os.path.isfile(source_path):
             raise FileNotFoundError(f"Source model does not exist: {source_path}")
@@ -308,6 +344,8 @@ class TargetedQuantizationGGUF:
             overwrite=overwrite,
             quant_type_name=None if quantization == TARGET_SIZE_QUANT_TYPE else quantization,
             max_size_mb=max_size_mb if quantization == TARGET_SIZE_QUANT_TYPE else None,
+            target_size_q8_type=target_size_q8_type,
+            quantization_device=quantization_device,
             progress_callback=report_progress,
         )
         if progress["bar"] is not None:

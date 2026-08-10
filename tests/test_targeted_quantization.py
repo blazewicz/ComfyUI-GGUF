@@ -3,6 +3,7 @@ from collections import OrderedDict
 import importlib.util
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import gguf
 import torch
@@ -16,6 +17,8 @@ from tools.convert import (
     convert_file,
     detect_arch,
     plan_target_size_quantization,
+    quantize_int8_convrot,
+    resolve_quantization_device,
 )
 
 
@@ -46,13 +49,13 @@ class TargetSizeQuantizationTests(unittest.TestCase):
 
     def test_reduces_center_core_layers_before_outer_layers(self):
         plan, _, selected_size = plan_target_size_quantization(
-            self.state_dict, self.model_arch, 0.38
+            self.state_dict, self.model_arch, 0.4
         )
 
-        self.assertEqual(plan["blocks.1.weight"], gguf.GGMLQuantizationType.Q4_0)
+        self.assertEqual(plan["blocks.1.weight"], gguf.GGMLQuantizationType.Q5_0)
         self.assertEqual(plan["blocks.0.weight"], gguf.GGMLQuantizationType.I8)
         self.assertEqual(plan["blocks.2.weight"], gguf.GGMLQuantizationType.I8)
-        self.assertLessEqual(selected_size, int(0.38 * MEBIBYTE))
+        self.assertLessEqual(selected_size, int(0.4 * MEBIBYTE))
 
     def test_reduces_one_dimensional_weights_only_after_all_core_layers(self):
         plan, _, selected_size = plan_target_size_quantization(
@@ -64,9 +67,88 @@ class TargetSizeQuantizationTests(unittest.TestCase):
         self.assertEqual(plan["normalization.weight"], gguf.GGMLQuantizationType.BF16)
         self.assertLessEqual(selected_size, int(0.222 * MEBIBYTE))
 
+    def test_supports_standard_q8_baseline(self):
+        plan, _, _ = plan_target_size_quantization(
+            self.state_dict,
+            self.model_arch,
+            2.0,
+            target_size_q8_type="Q8_0",
+        )
+
+        for index in range(3):
+            self.assertEqual(plan[f"blocks.{index}.weight"], gguf.GGMLQuantizationType.Q8_0)
+
     def test_reports_minimum_when_target_is_unsupported(self):
         with self.assertRaisesRegex(ValueError, "smallest supported TARGET_SIZE output"):
             plan_target_size_quantization(self.state_dict, self.model_arch, 0.1)
+
+
+class Q8CRConversionDeviceTests(unittest.TestCase):
+    def test_auto_uses_cpu_without_cuda(self):
+        with mock.patch("tools.convert.torch.cuda.is_available", return_value=False):
+            self.assertEqual(resolve_quantization_device("auto").type, "cpu")
+
+    def test_cuda_requires_available_device(self):
+        with mock.patch("tools.convert.torch.cuda.is_available", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "requires an available CUDA device"):
+                resolve_quantization_device("cuda")
+
+    def test_cpu_quantization_stays_on_cpu(self):
+        qdata, scale, _, _ = quantize_int8_convrot(
+            torch.arange(256, dtype=torch.float32).reshape(1, 256),
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(qdata.device.type, "cpu")
+        self.assertEqual(scale.device.type, "cpu")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_cuda_quantization_has_cpu_equivalent_decode_error(self):
+        torch.manual_seed(0)
+        weight = torch.randn((32, 256), dtype=torch.float32)
+        cpu_qdata, cpu_scale, _, _ = quantize_int8_convrot(weight, device=torch.device("cpu"))
+        cuda_qdata, cuda_scale, _, _ = quantize_int8_convrot(weight, device=torch.device("cuda"))
+
+        cpu_decoded = cpu_qdata.to(torch.float32) * cpu_scale
+        cuda_decoded = cuda_qdata.cpu().to(torch.float32) * cuda_scale.cpu()
+        self.assertTrue(torch.allclose(cpu_decoded, cuda_decoded, atol=1e-5, rtol=0))
+
+    def test_auto_device_serializes_q8_cr_layout(self):
+        state_dict = {
+            "video_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
+            "audio_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
+            "blocks.0.attn.qkv_proj.weight": torch.ones((96, 32), dtype=torch.float32),
+            "final_layer.video_out.weight": torch.ones((96, 32), dtype=torch.float32),
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "minimax_h3.safetensors"
+            output_path = Path(temp_dir) / "minimax_h3-Q8_CR.gguf"
+            save_file(state_dict, str(source_path))
+
+            converted_path, _ = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="Q8_CR",
+                quantization_device="auto",
+            )
+
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+        self.assertEqual(
+            tensor_types["blocks.0.attn.qkv_proj.weight"],
+            gguf.GGMLQuantizationType.I8,
+        )
+        self.assertEqual(
+            tensor_types["blocks.0.attn.qkv_proj.weight_scale"],
+            gguf.GGMLQuantizationType.F32,
+        )
 
 
 class Qwen3VLDetectionMarkerTests(unittest.TestCase):

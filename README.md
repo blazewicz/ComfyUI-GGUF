@@ -91,7 +91,8 @@ For the portable Windows distribution, use its embedded Python executable:
 ```bat
 .\python_embeded\python.exe .\ComfyUI\custom_nodes\ComfyUI-GGUF\tools\convert.py ^
   --src C:\path\to\krea2_or_ideogram.safetensors ^
-  --dst C:\path\to\model-Q8_CR.gguf --quant-type Q8_CR
+  --dst C:\path\to\model-Q8_CR.gguf --quant-type Q8_CR ^
+  --quantization-device auto
 ```
 
 Place the resulting GGUF in `ComfyUI/models/unet` or
@@ -141,6 +142,13 @@ During conversion, the converter:
    row.
 4. Stores the INT8 payload, scales, and ConvRot metadata in the GGUF file.
 
+`Q8_CR` conversion accepts `--quantization-device auto`, `cpu`, or `cuda`.
+`auto` uses CUDA when available; every matrix returns to CPU after
+quantization for normal GGUF serialization. If one matrix cannot fit in free
+VRAM, the converter logs a CPU fallback for that matrix without changing its
+output format. Standard GGML formats (`Q8_0`, `Q5_*`, and `Q4_*`) continue to
+use the CPU quantizer.
+
 During loading, the GGUF loader recognizes this metadata and passes the raw
 INT8 weights and row scales to ComfyUI's `TensorWiseINT8Layout`. On supported
 CUDA systems, ComfyUI executes the native INT8/ConvRot Linear path directly;
@@ -186,17 +194,21 @@ progress bar. A multi-CLIP loader uses one bar for every selected file.
 
 Use `tools/convert.py --max-size-mb <MiB>` to create the best supported mixed
 quantization below a maximum output size. The converter starts with core 2-D
-Linear weights in Q8_CR while preserving 1-D and architecture-sensitive tensors
-in FP32. It then changes core matrices closest to the model's center to Q4_0
-until the target is met, retaining the beginning and end in Q8_CR for as long as
-possible. If every Q4_0-compatible core matrix is already Q4_0, ordinary 1-D
-tensors are reduced to BF16; protected tensors remain FP32.
+Linear weights in native INT8 ConvRot (`Q8_CR`) while preserving 1-D and
+architecture-sensitive tensors in FP32. Pass `--target-size-q8-type Q8_0` to
+use standard GGUF Q8 instead. It then changes core matrices closest to the
+model's center to Q5_0 and only then Q4_0 until the target is met, retaining
+the beginning and end at higher precision for as long as possible. If every
+Q4_0-compatible core matrix is already Q4_0, ordinary 1-D tensors are reduced
+to BF16; protected tensors remain FP32.
 
 `Q4_0` is the smallest supported core quantization. A target below the minimum
 attainable size raises an error that reports that minimum; Q3 and lower are not
 used. The **Targeted Quantization (GGUF)** ComfyUI node exposes the same source,
 destination, quantization, target-size, and overwrite options, reports loading
 and conversion progress, and outputs both the GGUF path and output details.
+Its **quantization device** option controls `Q8_CR` conversion with the same
+`auto`, `cpu`, and `cuda` behavior as the CLI.
 
 Reconvert any `Q8_CR` GGUF created before ConvRot weights were marked as
 pre-rotated. Older files load safely with native non-rotated INT8 instead.

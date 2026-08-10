@@ -329,6 +329,9 @@ QUANT_TYPE_MAP = {
 }
 
 TARGET_SIZE_QUANT_TYPE = "TARGET_SIZE"
+TARGET_SIZE_Q8_TYPES = ("Q8_CR", "Q8_0")
+DEFAULT_TARGET_SIZE_Q8_TYPE = "Q8_CR"
+QUANTIZATION_DEVICE_OPTIONS = ("auto", "cpu", "cuda")
 MEBIBYTE = 1024 * 1024
 
 
@@ -373,17 +376,30 @@ def _can_use_q4_0(data):
     return data.shape[-1] % block_size == 0
 
 
-def plan_target_size_quantization(state_dict, model_arch, max_size_mb):
+def plan_target_size_quantization(
+    state_dict,
+    model_arch,
+    max_size_mb,
+    target_size_q8_type=DEFAULT_TARGET_SIZE_Q8_TYPE,
+):
     """
     Select per-tensor types that fit a maximum serialized payload size.
 
-    Core 2-D tensors start in Q8_CR. The center of their checkpoint order is
-    downgraded first, leaving the beginning and end at Q8_CR as long as possible.
+    Core 2-D tensors start in the selected Q8 type. The center of their
+    checkpoint order is downgraded to Q5_0 first, then to Q4_0 only when
+    needed, leaving the beginning and end at higher precision as long as
+    possible.
     Once every Q4-compatible core tensor is Q4_0, ordinary 1-D tensors may be
     reduced to BF16. Protected tensors always remain F32.
     """
     if max_size_mb <= 0:
         raise ValueError("--max-size-mb must be greater than zero.")
+    if target_size_q8_type not in TARGET_SIZE_Q8_TYPES:
+        raise ValueError(
+            f"--target-size-q8-type must be one of {', '.join(TARGET_SIZE_Q8_TYPES)}, "
+            f"got {target_size_q8_type!r}."
+        )
+    target_q8_type = QUANT_TYPE_MAP[target_size_q8_type][0]
 
     plan = {}
     core_tensors = []
@@ -407,7 +423,7 @@ def plan_target_size_quantization(state_dict, model_arch, max_size_mb):
         elif len(data.shape) == 4 and "conv" in key.lower():
             plan[key] = gguf.GGMLQuantizationType.F16
         elif _is_target_core_tensor(key, data, model_arch):
-            plan[key] = gguf.GGMLQuantizationType.I8
+            plan[key] = target_q8_type
             if _can_use_q4_0(data):
                 core_tensors.append((key, data))
         else:
@@ -431,14 +447,22 @@ def plan_target_size_quantization(state_dict, model_arch, max_size_mb):
         return plan, maximum_size, maximum_size
 
     center = (len(core_tensors) - 1) / 2
-    for index, (key, _) in sorted(
-        enumerate(core_tensors),
-        key=lambda item: (abs(item[0] - center), item[0]),
+    center_first_core_tensors = [
+        (key, data)
+        for _, (key, data) in sorted(
+            enumerate(core_tensors),
+            key=lambda item: (abs(item[0] - center), item[0]),
+        )
+    ]
+    for target_qtype in (
+        gguf.GGMLQuantizationType.Q5_0,
+        gguf.GGMLQuantizationType.Q4_0,
     ):
-        plan[key] = gguf.GGMLQuantizationType.Q4_0
-        current_size = plan_size()
-        if current_size <= target_size:
-            return plan, maximum_size, current_size
+        for key, _ in center_first_core_tensors:
+            plan[key] = target_qtype
+            current_size = plan_size()
+            if current_size <= target_size:
+                return plan, maximum_size, current_size
 
     for key, _ in one_dimensional_tensors:
         plan[key] = gguf.GGMLQuantizationType.BF16
@@ -455,11 +479,39 @@ def plan_target_size_quantization(state_dict, model_arch, max_size_mb):
     )
 
 
-def quantize_int8_convrot(weight, convrot_groupsize=256):
+def _validate_quantization_device(device):
+    if device not in QUANTIZATION_DEVICE_OPTIONS:
+        raise ValueError(
+            f"--quantization-device must be one of {', '.join(QUANTIZATION_DEVICE_OPTIONS)}, "
+            f"got {device!r}."
+        )
+
+
+def resolve_quantization_device(device):
+    _validate_quantization_device(device)
+    if device == "cpu":
+        return torch.device("cpu")
+    if not torch.cuda.is_available():
+        if device == "cuda":
+            raise RuntimeError("--quantization-device cuda requires an available CUDA device.")
+        return torch.device("cpu")
+    return torch.device("cuda")
+
+
+def _can_use_cuda_q8_cr(data, device):
+    # ConvRot needs the uploaded source plus F32 rotation and quantization workspaces.
+    required_bytes = data.numel() * 16 + data.shape[0] * 4
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    return required_bytes <= free_bytes
+
+
+def quantize_int8_convrot(weight, convrot_groupsize=256, device=None):
     """
     Quantize a 2D Linear weight to INT8 with ConvRot grouping.
     Uses per-output-channel scales to match ComfyUI's TensorWiseINT8Layout.
     """
+    if device is not None:
+        weight = weight.to(device)
     weight = weight.to(torch.float32)
     orig_shape = tuple(weight.shape)
     groupsize = next(
@@ -548,8 +600,26 @@ def parse_args():
         default=None,
         help=(
             "Maximum output payload size in MiB. Selects TARGET_SIZE quantization: "
-            "Q8_CR core weights are progressively changed to Q4_0 from the model "
-            "center outward, then ordinary 1-D tensors to BF16 if necessary."
+            "selected-Q8 core weights are progressively changed to Q5_0 then Q4_0 "
+            "from the model center outward, then ordinary 1-D tensors to BF16 if necessary."
+        ),
+    )
+    parser.add_argument(
+        "--target-size-q8-type",
+        choices=TARGET_SIZE_Q8_TYPES,
+        default=DEFAULT_TARGET_SIZE_Q8_TYPE,
+        help=(
+            "Q8 representation used by --max-size-mb before core matrices are reduced to Q4_0. "
+            "Q8_CR uses native INT8 ConvRot; Q8_0 uses standard GGUF Q8."
+        ),
+    )
+    parser.add_argument(
+        "--quantization-device",
+        choices=QUANTIZATION_DEVICE_OPTIONS,
+        default="auto",
+        help=(
+            "Device for Q8_CR conversion. auto uses CUDA when available; CPU remains "
+            "the fallback for individual matrices that cannot fit in available VRAM."
         ),
     )
     args = parser.parse_args()
@@ -619,7 +689,16 @@ def load_safetensors_metadata(path):
     with safe_open(path, framework="pt", device="cpu") as checkpoint:
         return checkpoint.metadata() or {}
 
-def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_name=None, quantization_plan=None, progress_callback=None):
+def handle_tensors(
+    writer,
+    state_dict,
+    model_arch,
+    quant_type=None,
+    quant_type_name=None,
+    quantization_plan=None,
+    quantization_device="auto",
+    progress_callback=None,
+):
     # Pre-collect per-tensor FP8 scales (0-dim float32 tensors named "{key}_scale").
     # These must be applied to their FP8 weight tensors before GGUF quantization.
     # The actual weight value is fp8_value * scale; ignoring scale produces wrong magnitudes.
@@ -642,6 +721,8 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
     if max_name_len > MAX_TENSOR_NAME_LENGTH:
         bad_list = ", ".join(f"{key!r} ({namelen})" for key, namelen in name_lengths if namelen > MAX_TENSOR_NAME_LENGTH)
         raise ValueError(f"Can only handle tensor names up to {MAX_TENSOR_NAME_LENGTH} characters. Tensors exceeding the limit: {bad_list}")
+    _validate_quantization_device(quantization_device)
+    q8_cr_device = None
     for tensor_index, (key, data) in enumerate(tqdm(state_dict.items()), start=1):
         old_dtype = data.dtype
 
@@ -729,9 +810,43 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
 
         # Q8_CR is the supported custom quantization path.
         if data_qtype == gguf.GGMLQuantizationType.I8 and n_dims == 2:
-            qdata, scale, quant_conf, orig_shape = quantize_int8_convrot(torch.from_numpy(data))
-            writer.add_tensor(key, qdata.numpy(), raw_dtype=gguf.GGMLQuantizationType.I8)
-            writer.add_tensor(f"{key}_scale", scale.numpy(), raw_dtype=gguf.GGMLQuantizationType.F32)
+            quantization_tensor = torch.from_numpy(data)
+            if q8_cr_device is None:
+                q8_cr_device = resolve_quantization_device(quantization_device)
+            device = q8_cr_device
+            if device.type == "cuda" and not _can_use_cuda_q8_cr(quantization_tensor, device):
+                logging.warning(
+                    "Q8_CR CUDA fallback for %s: insufficient free VRAM for this matrix.",
+                    key,
+                )
+                device = torch.device("cpu")
+            try:
+                qdata, scale, quant_conf, orig_shape = quantize_int8_convrot(
+                    quantization_tensor,
+                    device=device,
+                )
+            except torch.OutOfMemoryError:
+                if device.type != "cuda":
+                    raise
+                torch.cuda.empty_cache()
+                logging.warning(
+                    "Q8_CR CUDA fallback for %s: CUDA ran out of memory while quantizing.",
+                    key,
+                )
+                qdata, scale, quant_conf, orig_shape = quantize_int8_convrot(
+                    quantization_tensor,
+                    device=torch.device("cpu"),
+                )
+            writer.add_tensor(
+                key,
+                qdata.cpu().numpy(),
+                raw_dtype=gguf.GGMLQuantizationType.I8,
+            )
+            writer.add_tensor(
+                f"{key}_scale",
+                scale.cpu().numpy(),
+                raw_dtype=gguf.GGMLQuantizationType.F32,
+            )
             writer.add_string(f"comfy.gguf.quant.{key}", json.dumps(quant_conf))
             if progress_callback is not None:
                 progress_callback("quantize", tensor_index, len(state_dict))
@@ -765,7 +880,17 @@ def handle_tensors(writer, state_dict, model_arch, quant_type=None, quant_type_n
         if progress_callback is not None:
             progress_callback("quantize", tensor_index, len(state_dict))
 
-def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type_name=None, max_size_mb=None, progress_callback=None):
+def convert_file(
+    path,
+    dst_path=None,
+    interact=True,
+    overwrite=False,
+    quant_type_name=None,
+    max_size_mb=None,
+    target_size_q8_type=DEFAULT_TARGET_SIZE_Q8_TYPE,
+    quantization_device="auto",
+    progress_callback=None,
+):
     # load & run model detection logic
     state_dict = load_state_dict(path, progress_callback=progress_callback)
     source_metadata = load_safetensors_metadata(path)
@@ -780,11 +905,15 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type
     if max_size_mb is not None:
         quant_type_name = TARGET_SIZE_QUANT_TYPE
         quantization_plan, maximum_size, selected_size = plan_target_size_quantization(
-            state_dict, model_arch, max_size_mb
+            state_dict,
+            model_arch,
+            max_size_mb,
+            target_size_q8_type=target_size_q8_type,
         )
         logging.info(
-            "TARGET_SIZE selected %.2f MiB from a Q8_CR baseline of %.2f MiB.",
+            "TARGET_SIZE selected %.2f MiB from a %s baseline of %.2f MiB.",
             selected_size / MEBIBYTE,
+            target_size_q8_type,
             maximum_size / MEBIBYTE,
         )
 
@@ -838,6 +967,7 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type
         quant_type=quant_type,
         quant_type_name=quant_type_name,
         quantization_plan=quantization_plan,
+        quantization_device=quantization_device,
         progress_callback=progress_callback,
     )
     writer.write_header_to_file(path=dst_path)
@@ -854,4 +984,11 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False, quant_type
 
 if __name__ == "__main__":
     args = parse_args()
-    convert_file(args.src, args.dst, quant_type_name=args.quant_type, max_size_mb=args.max_size_mb)
+    convert_file(
+        args.src,
+        args.dst,
+        quant_type_name=args.quant_type,
+        max_size_mb=args.max_size_mb,
+        target_size_q8_type=args.target_size_q8_type,
+        quantization_device=args.quantization_device,
+    )
