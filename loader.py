@@ -12,7 +12,7 @@ from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 from .quant_ops import make_quantized
 
-IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image", "ideogram", "krea2", "minimax_h3"}
+IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image", "ideogram", "krea2", "minimax_h3", "minimax_h3_vae"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 

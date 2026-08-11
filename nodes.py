@@ -1,5 +1,6 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import torch
+import gguf
 import logging
 import inspect
 import collections
@@ -17,9 +18,9 @@ import comfy.model_management
 import comfy.memory_management
 import folder_paths
 
-from .ops import GGMLOps, get_gguf_q8_ops, move_patch_to_device
+from .ops import GGMLTensor, GGMLOps, get_gguf_q8_ops, move_patch_to_device
 from .loader import gguf_sd_loader, gguf_clip_loader, gguf_tensor_count
-from .dequant import is_quantized, is_torch_compatible
+from .dequant import dequantize_tensor, is_quantized, is_torch_compatible
 from .tools.convert import (
     DEFAULT_TARGET_SIZE_Q8_TYPE,
     QUANT_TYPE_MAP,
@@ -49,6 +50,7 @@ def update_folder_names_and_paths(key, targets=[]):
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 update_folder_names_and_paths("lora_gguf", ["loras"])
+update_folder_names_and_paths("vae_gguf", ["vae"])
 
 
 class GGUFLoadProgress:
@@ -239,6 +241,59 @@ class UnetLoaderGGUF:
         model = GGUFModelPatcher.clone(model)
         model.patch_on_device = patch_on_device
         return (model,)
+
+
+class VAELoaderGGUF:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vae_name": (folder_paths.get_filename_list("vae_gguf"),),
+            }
+        }
+
+    RETURN_TYPES = ("VAE",)
+    FUNCTION = "load_vae"
+    CATEGORY = "bootleg"
+    TITLE = "VAE Loader (GGUF)"
+
+    def load_vae(self, vae_name):
+        vae_path = folder_paths.get_full_path("vae", vae_name)
+        progress = GGUFLoadProgress([vae_path])
+        sd, extra = gguf_sd_loader(
+            vae_path,
+            handle_prefix=None,
+            progress_callback=progress.callback_for(vae_path),
+        )
+        progress.complete_file(vae_path)
+
+        if extra["arch_str"] != "minimax_h3_vae":
+            raise ValueError(
+                "VAE Loader (GGUF) currently supports only MiniMax H3 video VAE GGUF files."
+            )
+        if extra.get("gguf_quant_mode") != "int8_convrot":
+            raise ValueError(
+                "MiniMax H3 VAE GGUF must use Q8_CR so decoder Linear weights stay on the native INT8 path."
+            )
+
+        for key, value in tuple(sd.items()):
+            if isinstance(value, GGMLTensor):
+                dtype = (
+                    torch.float32
+                    if value.tensor_type == gguf.GGMLQuantizationType.F32
+                    else torch.float16
+                )
+                sd[key] = dequantize_tensor(value, dtype=dtype)
+
+        operations = get_gguf_q8_ops(compute_dtype=torch.float16)()
+        vae = comfy.sd.VAE(
+            sd=sd,
+            metadata=extra.get("metadata", {}),
+            operations=operations,
+            disable_dynamic=True,
+        )
+        vae.throw_exception_if_invalid()
+        return (vae,)
 
 
 class TargetedQuantizationGGUF:
@@ -963,6 +1018,7 @@ NODE_CLASS_MAPPINGS = {
     "GGUFLoraImport": GGUFLoraImport,
     "FuseGGUFLorasQ8CR": FuseGGUFLorasQ8CR,
     "UnetLoaderGGUF": UnetLoaderGGUF,
+    "VAELoaderGGUF": VAELoaderGGUF,
     "CLIPLoaderGGUF": CLIPLoaderGGUF,
     "DualCLIPLoaderGGUF": DualCLIPLoaderGGUF,
     "TripleCLIPLoaderGGUF": TripleCLIPLoaderGGUF,

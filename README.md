@@ -99,6 +99,23 @@ For the portable Windows distribution, use its embedded Python executable:
 Place the resulting GGUF in `ComfyUI/models/unet` or
 `ComfyUI/models/diffusion_models`, then load it with **Unet Loader (GGUF)**.
 
+### MiniMax H3 video VAE
+
+The **VAE Loader (GGUF)** supports MiniMax H3 video VAE files converted with
+`Q8_CR`. Use the same converter with the VAE checkpoint:
+
+```bash
+python tools/convert.py --src /path/to/minimax_h3_video_vae_fp16.safetensors \
+  --dst /path/to/minimax_h3_video_vae-Q8_CR.gguf --quant-type Q8_CR
+```
+
+Place the result in `ComfyUI/models/vae` and load it with **VAE Loader (GGUF)**.
+Only the ViT3D decoder's 2-D Linear weights use native INT8 ConvRot; its
+Conv3d tensors, norms, buffers, and other non-Linear weights remain floating
+point. This loader requires the accompanying ComfyUI support for injected
+MiniMax H3 VAE operations and intentionally uses static VAE loading. Validate
+quality and decode latency for your workflow before replacing an FP16 VAE.
+
 ## Supported conversion formats
 
 The standard GGUF formats use the package's normal GGML loader path. `Q8_CR`

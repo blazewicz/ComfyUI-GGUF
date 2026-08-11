@@ -21,6 +21,7 @@ MAX_TENSOR_DIMS = 4
 class ModelTemplate:
     arch = "invalid"  # string describing architecture
     shape_fix = False # whether to reshape tensors
+    preserve_nd_shapes = False
     keys_detect = []  # list of lists to match in state dict
     keys_banned = []  # list of keys that should mark model as invalid for conversion
     keys_hiprec = []  # list of keys that need to be kept in fp32 for some reason
@@ -260,9 +261,21 @@ class ModelMinimaxH3(ModelTemplate):
     keys_hiprec = ["adaln_t_table"]
 
 
+class ModelMinimaxH3VAE(ModelTemplate):
+    arch = "minimax_h3_vae"
+    preserve_nd_shapes = True
+    keys_detect = [
+        (
+            "decoder.transformer_blocks.0.scale1",
+            "decoder.x_embedder.weight",
+            "encoder.down.5.block.0.conv1.weight",
+        )
+    ]
+
+
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
              ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
-             ModelKrea2, ModelIdeogram, ModelMinimaxH3]
+             ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE]
 
 def is_model_arch(model, state_dict):
     # check if model is correct
@@ -777,10 +790,21 @@ def handle_tensors(
         data_shape = data.shape
         data_qtype = _default_qtype(old_dtype)
 
-        # The max no. of dimensions that can be handled by the quantization code is 4.
+        # GGUF supports at most four dimensions. VAE Conv3d weights preserve
+        # their original shape in metadata and combine their final dimensions
+        # only for storage.
         if n_dims > MAX_TENSOR_DIMS:
-            model_arch.handle_nd_tensor(key, data)
-            continue
+            if not model_arch.preserve_nd_shapes:
+                model_arch.handle_nd_tensor(key, data)
+                continue
+            orig_shape = data.shape
+            data = data.reshape(*data.shape[:MAX_TENSOR_DIMS - 1], -1)
+            data_shape = data.shape
+            n_dims = len(data_shape)
+            writer.add_array(
+                f"comfy.gguf.orig_shape.{key}",
+                tuple(int(dim) for dim in orig_shape),
+            )
 
         n_params = 1
         for dim_size in data_shape:

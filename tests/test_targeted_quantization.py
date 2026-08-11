@@ -1,5 +1,6 @@
 import unittest
 import json
+import gc
 from collections import OrderedDict
 import importlib.util
 from pathlib import Path
@@ -14,6 +15,7 @@ from safetensors.torch import save_file
 from tools.convert import (
     MEBIBYTE,
     ModelMinimaxH3,
+    ModelMinimaxH3VAE,
     ModelTemplate,
     convert_file,
     detect_arch,
@@ -150,6 +152,66 @@ class Q8CRConversionDeviceTests(unittest.TestCase):
         self.assertEqual(
             tensor_types["blocks.0.attn.qkv_proj.weight_scale"],
             gguf.GGMLQuantizationType.F32,
+        )
+
+
+class MiniMaxH3VAEConversionTests(unittest.TestCase):
+    def test_detects_video_vae_from_distinctive_decoder_and_encoder_keys(self):
+        state_dict = {
+            "decoder.transformer_blocks.0.scale1": torch.ones(32),
+            "decoder.x_embedder.weight": torch.ones((64, 32)),
+            "encoder.down.5.block.0.conv1.weight": torch.ones((2, 2, 3, 3, 3)),
+        }
+
+        self.assertIsInstance(detect_arch(state_dict), ModelMinimaxH3VAE)
+
+    def test_q8_cr_keeps_conv3d_fp16_and_restores_its_shape(self):
+        state_dict = {
+            "decoder.transformer_blocks.0.scale1": torch.ones(32, dtype=torch.float16),
+            "decoder.x_embedder.weight": torch.ones((64, 32), dtype=torch.float16),
+            "encoder.down.5.block.0.conv1.weight": torch.ones(
+                (2, 2, 3, 3, 3), dtype=torch.float16
+            ),
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "minimax_h3_vae.safetensors"
+            output_path = Path(temp_dir) / "minimax_h3_vae-Q8_CR.gguf"
+            save_file(state_dict, str(source_path))
+
+            converted_path, _ = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="Q8_CR",
+                quantization_device="cpu",
+            )
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+            loader = load_gguf_loader()
+            loaded, extra = loader.gguf_sd_loader(converted_path, handle_prefix=None)
+            conv3d_shape = tuple(
+                loaded["encoder.down.5.block.0.conv1.weight"].tensor_shape
+            )
+            del loaded
+            gc.collect()
+
+        self.assertEqual(extra["arch_str"], "minimax_h3_vae")
+        self.assertEqual(
+            tensor_types["decoder.x_embedder.weight"], gguf.GGMLQuantizationType.I8
+        )
+        self.assertEqual(
+            tensor_types["encoder.down.5.block.0.conv1.weight"],
+            gguf.GGMLQuantizationType.F16,
+        )
+        self.assertEqual(
+            conv3d_shape,
+            (2, 2, 3, 3, 3),
         )
 
 
