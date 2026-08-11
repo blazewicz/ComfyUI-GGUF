@@ -4,6 +4,7 @@ import os
 
 import gguf
 import torch
+from safetensors import safe_open
 
 
 _SUPPORTED_FACTOR_TYPES = {
@@ -11,6 +12,14 @@ _SUPPORTED_FACTOR_TYPES = {
     gguf.GGMLQuantizationType.F16,
     gguf.GGMLQuantizationType.BF16,
     gguf.GGMLQuantizationType.Q8_0,
+}
+_FP8_SOURCE_TYPES = {
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+    )
+    if dtype is not None
 }
 
 
@@ -61,6 +70,49 @@ def _tensor_to_float(tensor):
     ).reshape(shape).to(torch.float16)
 
 
+def _build_targets(pairs, path, architecture=None, default_alpha=None):
+    if not pairs:
+        raise ValueError("LoRA contains no factor tensors.")
+
+    lora = {}
+    targets = {}
+    for base_name, pair in pairs.items():
+        if not {"a", "b"}.issubset(pair):
+            raise ValueError(f"LoRA target {base_name!r} is missing one factor.")
+        down, up = pair["a"], pair["b"]
+        if down.ndim != 2 or up.ndim != 2:
+            raise ValueError(
+                f"LoRA target {base_name!r} is not 2-D; convolutional and other "
+                "adapter layouts are not supported."
+            )
+        if down.shape[0] != up.shape[1]:
+            raise ValueError(
+                f"LoRA target {base_name!r} has incompatible factor shapes "
+                f"{tuple(down.shape)} and {tuple(up.shape)}."
+            )
+        target_name = base_name.removesuffix(".weight")
+        source_name = base_name if base_name.endswith(".weight") else f"{base_name}.weight"
+        alpha = pair.get("alpha", default_alpha)
+        lora[f"{target_name}.lora_A.weight"] = down
+        lora[f"{target_name}.lora_B.weight"] = up
+        if alpha is not None:
+            lora[f"{target_name}.alpha"] = torch.tensor(alpha, dtype=torch.float32)
+        targets[target_name] = {
+            "base_name": source_name,
+            "down": down,
+            "up": up,
+            "alpha": alpha,
+        }
+
+    metadata = {
+        "path": os.path.abspath(path),
+        "architecture": architecture,
+        "alpha": default_alpha,
+        "target_count": len(targets),
+    }
+    return lora, targets, metadata
+
+
 def load_gguf_lora(path):
     """Read a standard GGUF LoRA into ComfyUI's lora_A/lora_B dictionary form."""
     reader = gguf.GGUFReader(path)
@@ -70,7 +122,6 @@ def load_gguf_lora(path):
         if _read_string_field(reader, "adapter.type") != "lora":
             raise ValueError("GGUF adapter is not a LoRA (adapter.type must be 'lora').")
 
-        alpha = _read_float_field(reader, "adapter.lora.alpha")
         pairs = {}
         for tensor in reader.tensors:
             if tensor.name.endswith(".lora_a"):
@@ -85,48 +136,63 @@ def load_gguf_lora(path):
                     "'.lora_a' and '.lora_b' factors are supported."
                 )
 
-        if not pairs:
-            raise ValueError("GGUF LoRA contains no factor tensors.")
-
-        lora = {}
-        targets = {}
-        for base_name, pair in pairs.items():
-            if set(pair) != {"a", "b"}:
-                raise ValueError(f"GGUF LoRA target {base_name!r} is missing one factor.")
-            down, up = pair["a"], pair["b"]
-            if down.ndim != 2 or up.ndim != 2:
-                raise ValueError(
-                    f"GGUF LoRA target {base_name!r} is not 2-D; convolutional and "
-                    "other adapter layouts are not supported."
-                )
-            if down.shape[0] != up.shape[1]:
-                raise ValueError(
-                    f"GGUF LoRA target {base_name!r} has incompatible factor shapes "
-                    f"{tuple(down.shape)} and {tuple(up.shape)}."
-                )
-            target_name = base_name[:-len(".weight")] if base_name.endswith(".weight") else base_name
-            lora[f"{target_name}.lora_A.weight"] = down
-            lora[f"{target_name}.lora_B.weight"] = up
-            if alpha is not None:
-                lora[f"{target_name}.alpha"] = torch.tensor(alpha, dtype=torch.float32)
-            targets[target_name] = {
-                "base_name": base_name,
-                "down": down,
-                "up": up,
-                "alpha": alpha,
-            }
-
-        metadata = {
-            "path": os.path.abspath(path),
-            "architecture": _read_string_field(reader, "general.architecture", required=False),
-            "alpha": alpha,
-            "target_count": len(targets),
-        }
-        return lora, targets, metadata
+        return _build_targets(
+            pairs,
+            path,
+            architecture=_read_string_field(reader, "general.architecture", required=False),
+            default_alpha=_read_float_field(reader, "adapter.lora.alpha"),
+        )
     finally:
         reader.tensors.clear()
         reader.fields.clear()
         reader.data._mmap.close()
+
+
+_SAFETENSORS_FACTOR_SUFFIXES = (
+    (".lora_A.weight", "a"),
+    (".lora_B.weight", "b"),
+    (".lora_down.weight", "a"),
+    (".lora_up.weight", "b"),
+)
+
+
+def load_safetensors_lora(path):
+    """Load direct ComfyUI and Diffusers-style Linear LoRA factor names."""
+    pairs = {}
+    with safe_open(path, framework="pt", device="cpu") as checkpoint:
+        keys = set(checkpoint.keys())
+        for key in keys:
+            match = next(
+                ((suffix, factor) for suffix, factor in _SAFETENSORS_FACTOR_SUFFIXES if key.endswith(suffix)),
+                None,
+            )
+            if match is None:
+                continue
+            suffix, factor = match
+            base_name = key[:-len(suffix)]
+            pairs.setdefault(base_name, {})[factor] = checkpoint.get_tensor(key)
+
+        for base_name, pair in pairs.items():
+            for alpha_key in (f"{base_name}.alpha", f"{base_name}.lora_alpha"):
+                if alpha_key not in keys:
+                    continue
+                alpha = checkpoint.get_tensor(alpha_key)
+                if alpha.numel() != 1:
+                    raise ValueError(f"LoRA alpha {alpha_key!r} must be a scalar.")
+                pair["alpha"] = float(alpha.item())
+                break
+
+    return _build_targets(pairs, path)
+
+
+def load_lora(path):
+    """Load a GGUF or safetensors LoRA suitable for offline fusion."""
+    extension = os.path.splitext(path)[1].lower()
+    if extension == ".gguf":
+        return load_gguf_lora(path)
+    if extension == ".safetensors":
+        return load_safetensors_lora(path)
+    raise ValueError(f"LoRA fusion accepts .gguf or .safetensors adapters, got {path!r}.")
 
 
 def resolve_fusion_targets(state_dict, targets):
@@ -170,17 +236,26 @@ def fuse_targets_into_state_dict(state_dict, targets, strength, device):
     resolved = resolve_fusion_targets(state_dict, targets)
     for state_key, target in resolved.items():
         source = state_dict[state_key]
-        if source.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        source_dtype = source.dtype
+        if source_dtype not in {torch.float16, torch.bfloat16, torch.float32, *_FP8_SOURCE_TYPES}:
             raise ValueError(
                 f"Fusion target {state_key!r} has unsupported dtype {source.dtype}. "
-                "Fuse from an FP16, BF16, or FP32 checkpoint."
+                "Fuse from an FP16, BF16, FP32, or scaled FP8 checkpoint."
             )
         down = target["down"].to(device=device, dtype=torch.float32)
         up = target["up"].to(device=device, dtype=torch.float32)
         alpha = target["alpha"] if target["alpha"] is not None else down.shape[0]
         fused = source.to(device=device, dtype=torch.float32)
+        if source_dtype in _FP8_SOURCE_TYPES:
+            scale_key = f"{state_key}_scale"
+            scale = state_dict.get(scale_key)
+            if scale is not None:
+                if scale.numel() != 1:
+                    raise ValueError(f"FP8 scale tensor {scale_key!r} must be a scalar.")
+                fused.mul_(scale.to(device=device, dtype=torch.float32))
         fused.add_(up.matmul(down), alpha=strength * alpha / down.shape[0])
-        state_dict[state_key] = fused.to(device="cpu", dtype=source.dtype)
+        output_dtype = torch.float16 if source_dtype in _FP8_SOURCE_TYPES else source_dtype
+        state_dict[state_key] = fused.to(device="cpu", dtype=output_dtype)
         del down, up, fused
     return len(resolved)
 

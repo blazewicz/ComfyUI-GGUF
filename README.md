@@ -214,7 +214,7 @@ Its **quantization device** option controls `Q8_CR` conversion with the same
 Reconvert any `Q8_CR` GGUF created before ConvRot weights were marked as
 pre-rotated. Older files load safely with native non-rotated INT8 instead.
 
-## GGUF LoRAs and fused Q8_CR caches
+## LoRAs and fused GGUF exports
 
 **Load LoRA (GGUF)** imports standard GGUF adapters through ComfyUI's normal
 LoRA patch mechanism. It accepts `general.type=adapter`,
@@ -228,11 +228,22 @@ Imported GGUF LoRAs retain normal dynamic-patch behavior. They are a
 compatibility feature, not an INT8 acceleration: an active LoRA prevents
 `Q8_CR` Linear layers from staying on their native INT8 fast path.
 
-For a fixed adapter combination, use **Fuse GGUF LoRAs (Q8_CR Cache)** instead:
+For a fixed adapter combination, merge the adapters while exporting with
+`tools/convert.py --lora path/to/adapter.safetensors` (repeat `--lora` for
+multiple adapters and add matching `--lora-strength` values), or use the
+**Targeted Quantization (GGUF)** node's optional **lora_paths** and
+**lora_strengths** inputs. Both accept direct Linear LoRA factors in
+`.safetensors` (`.lora_A/.lora_B` or `.lora_down/.lora_up`) and standard GGUF
+LoRA adapters. Fusion is applied before the selected GGUF quantization.
+When a selected source target uses ComfyUI scaled FP8, its scale is applied
+before fusion and that patched target is retained as FP16 for export.
+
+The dedicated **Fuse LoRAs (Q8_CR Cache)** node remains available for a
+content-addressed Q8_CR cache:
 
 1. Set **source_path** to the original FP16, BF16, or FP32 diffusion checkpoint,
    never an already quantized GGUF.
-2. Supply absolute GGUF LoRA paths, one per line (or comma-separated), with a
+2. Supply absolute safetensors or GGUF LoRA paths, one per line (or comma-separated), with a
    matching comma-separated strength for each adapter.
 3. Leave **cache_directory** blank to use `gguf_lora_cache` beside the source,
    or specify a dedicated cache directory. Select `auto` to fuse and quantize

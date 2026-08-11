@@ -21,7 +21,7 @@ from tools.convert import (
     quantize_int8_convrot,
     resolve_quantization_device,
 )
-from lora import fuse_targets_into_state_dict, load_gguf_lora
+from lora import fuse_targets_into_state_dict, load_gguf_lora, load_lora
 
 
 def load_gguf_loader():
@@ -208,6 +208,101 @@ class GGUFLoraTests(unittest.TestCase):
         expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [4.0, 6.0]], dtype=torch.float16)
         self.assertEqual(count, 1)
         self.assertTrue(torch.equal(state_dict["blocks.0.attn.qkv_proj.weight"], expected))
+
+    def test_imports_and_fuses_safetensors_factor_pair(self):
+        down = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        up = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "adapter.safetensors"
+            save_file(
+                {
+                    "blocks.0.attn.qkv_proj.lora_A.weight": down,
+                    "blocks.0.attn.qkv_proj.lora_B.weight": up,
+                    "blocks.0.attn.qkv_proj.alpha": torch.tensor(4.0),
+                },
+                str(path),
+            )
+            _, targets, _ = load_lora(path)
+
+        state_dict = {
+            "blocks.0.attn.qkv_proj.weight": torch.zeros((3, 2), dtype=torch.float32)
+        }
+        fuse_targets_into_state_dict(state_dict, targets, strength=0.5, device=torch.device("cpu"))
+        expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [4.0, 6.0]])
+        self.assertTrue(torch.equal(state_dict["blocks.0.attn.qkv_proj.weight"], expected))
+
+    @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "PyTorch does not support FP8")
+    def test_fuses_scaled_fp8_target_as_fp16(self):
+        state_dict = {
+            "blocks.0.attn.qkv_proj.weight": torch.ones(
+                (2, 2), dtype=torch.float8_e4m3fn
+            ),
+            "blocks.0.attn.qkv_proj.weight_scale": torch.tensor(0.5),
+        }
+        targets = {
+            "blocks.0.attn.qkv_proj": {
+                "base_name": "blocks.0.attn.qkv_proj.weight",
+                "down": torch.eye(2),
+                "up": torch.eye(2),
+                "alpha": 2.0,
+            }
+        }
+
+        fuse_targets_into_state_dict(state_dict, targets, strength=1.0, device=torch.device("cpu"))
+
+        self.assertEqual(state_dict["blocks.0.attn.qkv_proj.weight"].dtype, torch.float16)
+        self.assertTrue(
+            torch.equal(
+                state_dict["blocks.0.attn.qkv_proj.weight"],
+                torch.tensor([[1.5, 0.5], [0.5, 1.5]], dtype=torch.float16),
+            )
+        )
+
+    def test_converter_merges_safetensors_lora_before_gguf_export(self):
+        source = {
+            "video_patch_proj.weight": torch.zeros((32, 32), dtype=torch.float16),
+            "audio_patch_proj.weight": torch.zeros((32, 32), dtype=torch.float16),
+            "blocks.0.attn.qkv_proj.weight": torch.zeros((96, 32), dtype=torch.float16),
+            "final_layer.video_out.weight": torch.zeros((96, 32), dtype=torch.float16),
+        }
+        down = torch.zeros((2, 32), dtype=torch.float16)
+        down[:, 0] = 1
+        up = torch.zeros((96, 2), dtype=torch.float16)
+        up[0] = 1
+
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "minimax_h3.safetensors"
+            lora_path = Path(temp_dir) / "adapter.safetensors"
+            output_path = Path(temp_dir) / "merged.gguf"
+            save_file(source, str(source_path))
+            save_file(
+                {
+                    "blocks.0.attn.qkv_proj.lora_A.weight": down,
+                    "blocks.0.attn.qkv_proj.lora_B.weight": up,
+                    "blocks.0.attn.qkv_proj.alpha": torch.tensor(2.0),
+                },
+                str(lora_path),
+            )
+            convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="F16",
+                lora_paths=[str(lora_path)],
+            )
+            reader = gguf.GGUFReader(str(output_path))
+            tensor = next(
+                tensor for tensor in reader.tensors
+                if tensor.name == "blocks.0.attn.qkv_proj.weight"
+            )
+            merged = torch.from_numpy(tensor.data.copy()).view(torch.float16).reshape(
+                tuple(reversed(tensor.shape))
+            )
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+
+        self.assertTrue(torch.equal(merged[0, :2], torch.tensor([2.0, 0.0], dtype=torch.float16)))
 
 
 class Qwen3VLDetectionMarkerTests(unittest.TestCase):

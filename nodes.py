@@ -32,7 +32,7 @@ from .tools.convert import (
     load_state_dict,
     resolve_quantization_device,
 )
-from .lora import cache_key, fuse_targets_into_state_dict, load_gguf_lora
+from .lora import cache_key, fuse_targets_into_state_dict, load_gguf_lora, load_lora
 
 def update_folder_names_and_paths(key, targets=[]):
     # check for existing key
@@ -304,6 +304,23 @@ class TargetedQuantizationGGUF:
                 ),
                 "overwrite": ("BOOLEAN", {"default": False}),
             },
+            "optional": {
+                "lora_paths": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                        "tooltip": "Absolute .safetensors or .gguf LoRA paths, one per line or comma-separated.",
+                    },
+                ),
+                "lora_strengths": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Comma-separated merge strengths matching lora_paths; blank uses 1.0.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("STRING", "STRING")
@@ -321,6 +338,8 @@ class TargetedQuantizationGGUF:
         target_size_q8_type,
         quantization_device,
         overwrite,
+        lora_paths="",
+        lora_strengths="",
     ):
         source_path = os.path.abspath(os.path.expanduser(source_path))
         if not os.path.isfile(source_path):
@@ -328,6 +347,8 @@ class TargetedQuantizationGGUF:
 
         if quantization == TARGET_SIZE_QUANT_TYPE and max_size_mb <= 0:
             raise ValueError("TARGET_SIZE requires max_size_mb greater than zero.")
+        lora_paths = _parse_lora_paths(lora_paths) if lora_paths.strip() else []
+        lora_strengths = _parse_strengths(lora_strengths, len(lora_paths)) if lora_paths else []
 
         progress = {"bar": None, "read_total": None, "total": None}
 
@@ -355,6 +376,8 @@ class TargetedQuantizationGGUF:
             target_size_q8_type=target_size_q8_type,
             quantization_device=quantization_device,
             progress_callback=report_progress,
+            lora_paths=lora_paths,
+            lora_strengths=lora_strengths,
         )
         if progress["bar"] is not None:
             progress["bar"].update_absolute(progress["total"], progress["total"])
@@ -461,12 +484,12 @@ def _parse_lora_paths(lora_paths):
         if path.strip()
     ]
     if not paths:
-        raise ValueError("Provide at least one GGUF LoRA path.")
+        raise ValueError("Provide at least one LoRA path.")
     for path in paths:
-        if not path.lower().endswith(".gguf"):
-            raise ValueError(f"GGUF LoRA fusion accepts only .gguf adapters, got {path!r}.")
+        if not path.lower().endswith((".gguf", ".safetensors")):
+            raise ValueError(f"LoRA fusion accepts only .gguf or .safetensors adapters, got {path!r}.")
         if not os.path.isfile(path):
-            raise FileNotFoundError(f"GGUF LoRA does not exist: {path}")
+            raise FileNotFoundError(f"LoRA does not exist: {path}")
     return paths
 
 
@@ -485,7 +508,7 @@ def _parse_strengths(strengths, count):
 
 
 class FuseGGUFLorasQ8CR:
-    """Fuse fixed GGUF LoRA combinations into a content-addressed Q8_CR cache."""
+    """Fuse fixed LoRA combinations into a content-addressed Q8_CR cache."""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -500,7 +523,7 @@ class FuseGGUFLorasQ8CR:
                     {
                         "multiline": True,
                         "default": "",
-                        "tooltip": "Absolute GGUF LoRA paths, one per line or comma-separated.",
+                        "tooltip": "Absolute .safetensors or .gguf LoRA paths, one per line or comma-separated.",
                     },
                 ),
                 "strengths": (
@@ -531,7 +554,7 @@ class FuseGGUFLorasQ8CR:
     RETURN_NAMES = ("gguf_path", "cache_info")
     FUNCTION = "fuse"
     CATEGORY = "bootleg/LoRA"
-    TITLE = "Fuse GGUF LoRAs (Q8_CR Cache)"
+    TITLE = "Fuse LoRAs (Q8_CR Cache)"
 
     def fuse(self, source_path, lora_paths, strengths, cache_directory, quantization_device):
         source_path = os.path.abspath(os.path.expanduser(source_path))
@@ -570,7 +593,7 @@ class FuseGGUFLorasQ8CR:
             )
         state_dict = load_state_dict(source_path)
         for lora_path, strength in zip(lora_paths, strengths):
-            _, targets, _ = load_gguf_lora(lora_path)
+            _, targets, _ = load_lora(lora_path)
             fuse_targets_into_state_dict(state_dict, targets, strength, device)
             if device.type == "cuda":
                 torch.cuda.empty_cache()

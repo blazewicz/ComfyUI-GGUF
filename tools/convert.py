@@ -5,9 +5,13 @@ import json
 import torch
 import logging
 import argparse
+import sys
 from tqdm import tqdm
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lora import fuse_targets_into_state_dict, load_lora
 
 QUANTIZATION_THRESHOLD = 1024
 REARRANGE_THRESHOLD = 512
@@ -588,6 +592,21 @@ def parse_args():
     parser.add_argument("--src", required=True, help="Source model ckpt/safetensors file.")
     parser.add_argument("--dst", help="Output GGUF file path.")
     parser.add_argument(
+        "--lora",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="LoRA .safetensors or .gguf adapter to merge before export. Repeat for multiple adapters.",
+    )
+    parser.add_argument(
+        "--lora-strength",
+        action="append",
+        type=float,
+        default=[],
+        metavar="VALUE",
+        help="Merge strength for each --lora, in the same order. Defaults to 1.0 for every adapter.",
+    )
+    parser.add_argument(
         "--quant-type",
         choices=list(QUANT_TYPE_MAP.keys()),
         default=None,
@@ -890,9 +909,27 @@ def convert_file(
     target_size_q8_type=DEFAULT_TARGET_SIZE_Q8_TYPE,
     quantization_device="auto",
     progress_callback=None,
+    lora_paths=None,
+    lora_strengths=None,
 ):
     state_dict = load_state_dict(path, progress_callback=progress_callback)
     source_metadata = load_safetensors_metadata(path)
+    lora_paths = lora_paths or []
+    lora_strengths = lora_strengths or []
+    if lora_strengths and len(lora_strengths) != len(lora_paths):
+        raise ValueError("Provide one --lora-strength for each --lora.")
+    if not lora_strengths:
+        lora_strengths = [1.0] * len(lora_paths)
+    if lora_paths:
+        device = resolve_quantization_device(quantization_device)
+        for lora_path, strength in zip(lora_paths, lora_strengths):
+            if not os.path.isfile(lora_path):
+                raise FileNotFoundError(f"LoRA does not exist: {lora_path}")
+            _, targets, _ = load_lora(lora_path)
+            fused_count = fuse_targets_into_state_dict(state_dict, targets, strength, device)
+            logging.info("Merged %d LoRA targets from %s.", fused_count, lora_path)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     return convert_state_dict(
         state_dict,
         dst_path=dst_path,
@@ -1020,4 +1057,6 @@ if __name__ == "__main__":
         max_size_mb=args.max_size_mb,
         target_size_q8_type=args.target_size_q8_type,
         quantization_device=args.quantization_device,
+        lora_paths=args.lora,
+        lora_strengths=args.lora_strength,
     )
