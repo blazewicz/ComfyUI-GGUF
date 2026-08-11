@@ -280,12 +280,25 @@ class VAELoaderGGUF:
                 sd[key] = dequantize_tensor(value, dtype=torch.Tensor(value).dtype)
 
         operations = get_gguf_q8_ops(compute_dtype=torch.float16)()
-        vae = comfy.sd.VAE(
-            sd=sd,
-            metadata=extra.get("metadata", {}),
-            operations=operations,
-            disable_dynamic=True,
-        )
+        vae_kwargs = {"sd": sd, "metadata": extra.get("metadata", {})}
+        vae_init_params = inspect.signature(comfy.sd.VAE.__init__).parameters
+        if "operations" in vae_init_params:
+            vae_kwargs["operations"] = operations
+            if "disable_dynamic" in vae_init_params:
+                vae_kwargs["disable_dynamic"] = True
+            vae = comfy.sd.VAE(**vae_kwargs)
+        else:
+            minimax_vae = comfy.ldm.minimax.vae
+            if not hasattr(minimax_vae, "ops"):
+                raise RuntimeError(
+                    "This ComfyUI version cannot inject Q8_CR operations into MiniMax H3 VAE."
+                )
+            original_operations = minimax_vae.ops
+            minimax_vae.ops = operations
+            try:
+                vae = comfy.sd.VAE(**vae_kwargs)
+            finally:
+                minimax_vae.ops = original_operations
         vae.throw_exception_if_invalid()
         return (vae,)
 
