@@ -23,6 +23,7 @@ from tools.convert import (
     quantize_int8_convrot,
     resolve_quantization_device,
 )
+from dequant import dequantize_tensor
 from lora import fuse_targets_into_state_dict, load_gguf_lora, load_lora
 
 
@@ -195,9 +196,12 @@ class MiniMaxH3VAEConversionTests(unittest.TestCase):
 
             loader = load_gguf_loader()
             loaded, extra = loader.gguf_sd_loader(converted_path, handle_prefix=None)
-            conv3d_shape = tuple(
-                loaded["encoder.down.5.block.0.conv1.weight"].tensor_shape
-            )
+            conv3d = loaded["encoder.down.5.block.0.conv1.weight"]
+            del conv3d.tensor_type
+            materialized = dequantize_tensor(conv3d, dtype=torch.Tensor(conv3d).dtype)
+            conv3d_shape = tuple(materialized.shape)
+            del materialized
+            del conv3d
             del loaded
             gc.collect()
 

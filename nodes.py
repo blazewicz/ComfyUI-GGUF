@@ -1,6 +1,5 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import torch
-import gguf
 import logging
 import inspect
 import collections
@@ -278,12 +277,7 @@ class VAELoaderGGUF:
 
         for key, value in tuple(sd.items()):
             if isinstance(value, GGMLTensor):
-                dtype = (
-                    torch.float32
-                    if value.tensor_type == gguf.GGMLQuantizationType.F32
-                    else torch.float16
-                )
-                sd[key] = dequantize_tensor(value, dtype=dtype)
+                sd[key] = dequantize_tensor(value, dtype=torch.Tensor(value).dtype)
 
         operations = get_gguf_q8_ops(compute_dtype=torch.float16)()
         vae = comfy.sd.VAE(
