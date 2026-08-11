@@ -1,4 +1,5 @@
 import unittest
+import json
 from collections import OrderedDict
 import importlib.util
 from pathlib import Path
@@ -20,6 +21,7 @@ from tools.convert import (
     quantize_int8_convrot,
     resolve_quantization_device,
 )
+from lora import fuse_targets_into_state_dict, load_gguf_lora
 
 
 def load_gguf_loader():
@@ -151,6 +153,63 @@ class Q8CRConversionDeviceTests(unittest.TestCase):
         )
 
 
+class GGUFLoraTests(unittest.TestCase):
+    def _write_lora(self, path, down, up, alpha=4.0):
+        writer = gguf.GGUFWriter(path=None, arch="minimax_h3")
+        writer.add_string("general.type", "adapter")
+        writer.add_string("adapter.type", "lora")
+        writer.add_float32("adapter.lora.alpha", alpha)
+        writer.add_tensor(
+            "blocks.0.attn.qkv_proj.weight.lora_a",
+            down.numpy(),
+            raw_dtype=gguf.GGMLQuantizationType.F32,
+        )
+        writer.add_tensor(
+            "blocks.0.attn.qkv_proj.weight.lora_b",
+            up.numpy(),
+            raw_dtype=gguf.GGMLQuantizationType.F32,
+        )
+        writer.write_header_to_file(path=str(path))
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    def test_imports_standard_gguf_factor_pair(self):
+        down = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        up = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "adapter.gguf"
+            self._write_lora(path, down, up)
+            lora, targets, metadata = load_gguf_lora(path)
+
+        self.assertEqual(metadata["alpha"], 4.0)
+        self.assertIn("blocks.0.attn.qkv_proj.lora_A.weight", lora)
+        self.assertIn("blocks.0.attn.qkv_proj.lora_B.weight", lora)
+        self.assertTrue(torch.equal(targets["blocks.0.attn.qkv_proj"]["down"], down))
+        self.assertTrue(torch.equal(targets["blocks.0.attn.qkv_proj"]["up"], up))
+
+    def test_fuses_lora_delta_in_selected_precision(self):
+        state_dict = {
+            "blocks.0.attn.qkv_proj.weight": torch.zeros((3, 2), dtype=torch.float16)
+        }
+        targets = {
+            "blocks.0.attn.qkv_proj": {
+                "base_name": "blocks.0.attn.qkv_proj.weight",
+                "down": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                "up": torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+                "alpha": 4.0,
+            }
+        }
+
+        count = fuse_targets_into_state_dict(
+            state_dict, targets, strength=0.5, device=torch.device("cpu")
+        )
+
+        expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [4.0, 6.0]], dtype=torch.float16)
+        self.assertEqual(count, 1)
+        self.assertTrue(torch.equal(state_dict["blocks.0.attn.qkv_proj.weight"], expected))
+
+
 class Qwen3VLDetectionMarkerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -187,6 +246,69 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
         self.assertEqual(
             state_dict["model.visual.merger.linear_fc2.weight"].shape,
             (4096, 4608),
+        )
+
+
+class Gemma4GGUFLoaderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.loader = load_gguf_loader()
+
+    def test_maps_e4b_specific_tensor_layout_to_comfyui(self):
+        state_dict = {
+            "token_embd.weight": torch.zeros(1),
+            "per_layer_token_embd.weight": torch.zeros(1),
+            "per_layer_model_proj.weight": torch.zeros(1),
+            "per_layer_proj_norm.weight": torch.zeros(1),
+            "blk.0.inp_gate.weight": torch.zeros(1),
+            "blk.0.proj.weight": torch.zeros(1),
+            "blk.0.layer_output_scale.weight": torch.zeros(1),
+            "blk.0.post_norm.weight": torch.zeros(1),
+            "blk.0.post_ffw_norm.weight": torch.zeros(1),
+        }
+
+        mapped = self.loader.sd_map_replace(state_dict, self.loader.GEMMA4_SD_MAP)
+
+        self.assertEqual(
+            set(mapped),
+            {
+                "model.embed_tokens.weight",
+                "model.embed_tokens_per_layer.weight",
+                "model.per_layer_model_projection.weight",
+                "model.per_layer_projection_norm.weight",
+                "model.layers.0.per_layer_input_gate.weight",
+                "model.layers.0.per_layer_projection.weight",
+                "model.layers.0.layer_scalar",
+                "model.layers.0.post_per_layer_input_norm.weight",
+                "model.layers.0.post_feedforward_layernorm.weight",
+            },
+        )
+
+    def test_recreates_gemma4_bpe_tokenizer_json(self):
+        tokenizer_json = self.loader.gemma4_tokenizer_json(
+            ["<pad>", "<eos>", "<bos>", "<unk>", "hello", "\u2581world"],
+            ["h e", "he llo"],
+            [3, 3, 3, 3, 1, 1],
+        )
+        tokenizer = json.loads(bytes(tokenizer_json.tolist()))
+
+        self.assertEqual(tokenizer["model"]["type"], "BPE")
+        self.assertEqual(tokenizer["model"]["vocab"]["hello"], 4)
+        self.assertEqual(tokenizer["pre_tokenizer"]["type"], "Metaspace")
+        self.assertEqual(
+            [token["content"] for token in tokenizer["added_tokens"]],
+            ["<pad>", "<eos>", "<bos>", "<unk>"],
+        )
+
+    def test_e4b_layout_is_detected_by_installed_comfyui(self):
+        state_dict = {
+            "model.layers.0.post_feedforward_layernorm.weight": torch.zeros(2560),
+            "model.layers.41.self_attn.q_norm.weight": torch.zeros(256),
+        }
+
+        self.assertEqual(
+            comfy.sd.detect_te_model(state_dict),
+            comfy.sd.TEModel.GEMMA_4_E4B,
         )
 
 

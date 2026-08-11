@@ -891,9 +891,38 @@ def convert_file(
     quantization_device="auto",
     progress_callback=None,
 ):
-    # load & run model detection logic
     state_dict = load_state_dict(path, progress_callback=progress_callback)
     source_metadata = load_safetensors_metadata(path)
+    return convert_state_dict(
+        state_dict,
+        dst_path=dst_path,
+        source_path=path,
+        source_metadata=source_metadata,
+        interact=interact,
+        overwrite=overwrite,
+        quant_type_name=quant_type_name,
+        max_size_mb=max_size_mb,
+        target_size_q8_type=target_size_q8_type,
+        quantization_device=quantization_device,
+        progress_callback=progress_callback,
+    )
+
+
+def convert_state_dict(
+    state_dict,
+    dst_path,
+    source_path="<in-memory>",
+    source_metadata=None,
+    interact=False,
+    overwrite=False,
+    quant_type_name=None,
+    max_size_mb=None,
+    target_size_q8_type=DEFAULT_TARGET_SIZE_Q8_TYPE,
+    quantization_device="auto",
+    progress_callback=None,
+):
+    """Convert an already loaded, prefix-normalized diffusion-model state dict."""
+    source_metadata = source_metadata or {}
     model_arch = detect_arch(state_dict)
     logging.info(f"* Architecture detected from input: {model_arch.arch}")
     validate_key_patterns(model_arch, state_dict)
@@ -942,7 +971,7 @@ def convert_file(
             ftype_gguf = gguf.LlamaFileType.MOSTLY_F16
 
     if dst_path is None:
-        dst_path = f"{os.path.splitext(path)[0]}-{ftype_name}.gguf"
+        dst_path = f"{os.path.splitext(source_path)[0]}-{ftype_name}.gguf"
     elif "{ftype}" in dst_path: # lcpp logic
         dst_path = dst_path.replace("{ftype}", ftype_name)
 

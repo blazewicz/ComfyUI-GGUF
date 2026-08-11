@@ -13,7 +13,7 @@ from .dequant import is_quantized, dequantize_tensor
 from .quant_ops import make_quantized
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image", "ideogram", "krea2", "minimax_h3"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
+TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def device_supports_bf16():
@@ -390,6 +390,18 @@ GEMMA3_SD_MAP.update({
     "post_attention_norm": "post_attention_layernorm",
 })
 
+# These specific keys must precede the generic token_embd mapping below.
+GEMMA4_SD_MAP = {
+    "per_layer_token_embd": "model.embed_tokens_per_layer",
+    "per_layer_model_proj": "model.per_layer_model_projection",
+    "per_layer_proj_norm": "model.per_layer_projection_norm",
+    "inp_gate": "per_layer_input_gate",
+    "layer_output_scale.weight": "layer_scalar",
+    "post_norm": "post_per_layer_input_norm",
+    ".proj.": ".per_layer_projection.",
+    **GEMMA3_SD_MAP,
+}
+
 CLIP_VISION_SD_MAP = {
     "mm.": "visual.merger.mlp.",
     "v.post_ln.": "visual.merger.ln_q.",
@@ -651,6 +663,73 @@ def gguf_gemma3_tokenizer_loader(path):
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
+def gemma4_tokenizer_json(tokens, merges, token_types):
+    if not tokens or not merges or not token_types:
+        raise ValueError("Missing Gemma 4 tokenizer metadata")
+    if len(tokens) != len(token_types):
+        raise ValueError("Gemma 4 tokenizer token and token-type counts differ")
+
+    # Gemma 4 stores its BPE vocabulary in standard GGUF token and merge fields.
+    data = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [
+            {
+                "id": index,
+                "content": token,
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            }
+            for index, (token, token_type) in enumerate(zip(tokens, token_types))
+            if token_type == 3
+        ],
+        "normalizer": None,
+        "pre_tokenizer": {
+            "type": "Metaspace",
+            "replacement": "\u2581",
+            "prepend_scheme": "never",
+            "split": True,
+        },
+        "post_processor": None,
+        "decoder": {
+            "type": "Metaspace",
+            "replacement": "\u2581",
+            "prepend_scheme": "never",
+            "split": True,
+        },
+        "model": {
+            "type": "BPE",
+            "dropout": None,
+            "unk_token": "<unk>",
+            "continuing_subword_prefix": None,
+            "end_of_word_suffix": None,
+            "fuse_unk": False,
+            "byte_fallback": False,
+            "ignore_merges": False,
+            "vocab": {token: index for index, token in enumerate(tokens)},
+            "merges": list(merges),
+        },
+    }
+    return torch.ByteTensor(list(json.dumps(data, ensure_ascii=False).encode("utf-8")))
+
+def gguf_gemma4_tokenizer_loader(path):
+    logging.info("Recreating Gemma 4 BPE tokenizer from GGUF metadata...")
+    reader = gguf.GGUFReader(path)
+    if get_field(reader, "tokenizer.ggml.model", str) != "gemma4":
+        raise ValueError("Expected a Gemma 4 tokenizer in the GGUF metadata")
+
+    tokenizer_json = gemma4_tokenizer_json(
+        get_list_field(reader, "tokenizer.ggml.tokens", str),
+        get_list_field(reader, "tokenizer.ggml.merges", str),
+        get_list_field(reader, "tokenizer.ggml.token_type", int),
+    )
+    del reader
+    return tokenizer_json
+
 def inject_qwen3vl_detection_markers(sd):
     """Add visual sentinels when a llama.cpp Qwen3-VL GGUF excludes its vision tower."""
     ln_key = "model.layers.0.input_layernorm.weight"
@@ -692,7 +771,7 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
-    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}:
+    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape[0] >= (64 * 1024):
@@ -701,12 +780,18 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
             elif arch == "gemma3":
                 sd["spiece_model"] = gguf_gemma3_tokenizer_loader(path)
+            elif arch == "gemma4":
+                sd["tokenizer_json"] = gguf_gemma4_tokenizer_loader(path)
             # See note above for T5.
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         if arch == "gemma3":
             sd = sd_map_replace(sd, GEMMA3_SD_MAP)
             sd = gemma3_norm_corrections(sd)
+        elif arch == "gemma4":
+            # ComfyUI calculates Gemma 4 RoPE frequencies itself.
+            sd.pop("rope_freqs.weight", None)
+            sd = sd_map_replace(sd, GEMMA4_SD_MAP)
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":

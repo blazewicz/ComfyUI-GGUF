@@ -52,6 +52,7 @@ Initial support for quantizing T5 has also been added recently, these can be use
 - [t5_v1.1-xxl GGUF](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
 - [Qwen3-VL-4B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF) 🍴
 - [Qwen3-VL-32B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-VL-32B-Instruct-GGUF) 🍴
+- [Gemma 4 GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF) text encoders (E2B, E4B, 12B, and 31B) with ComfyUI v0.30.0 or later. Gemma 4 GGUFs must include the standard `tokenizer.ggml.tokens`, `tokenizer.ggml.merges`, and `tokenizer.ggml.token_type` metadata. 🍴
 
 See the instructions in the [tools](https://github.com/city96/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants.
 
@@ -212,3 +213,36 @@ Its **quantization device** option controls `Q8_CR` conversion with the same
 
 Reconvert any `Q8_CR` GGUF created before ConvRot weights were marked as
 pre-rotated. Older files load safely with native non-rotated INT8 instead.
+
+## GGUF LoRAs and fused Q8_CR caches
+
+**Load LoRA (GGUF)** imports standard GGUF adapters through ComfyUI's normal
+LoRA patch mechanism. It accepts `general.type=adapter`,
+`adapter.type=lora`, and paired `.lora_a`/`.lora_b` tensors in F32, F16, BF16,
+or Q8_0. Put adapter files in `ComfyUI/models/loras` and select them in the
+node. The adapter tensor names must match the connected model or text encoder's
+normal ComfyUI LoRA mapping; unrecognized targets, incomplete factor pairs,
+convolutional factors, and non-LoRA adapter types are rejected.
+
+Imported GGUF LoRAs retain normal dynamic-patch behavior. They are a
+compatibility feature, not an INT8 acceleration: an active LoRA prevents
+`Q8_CR` Linear layers from staying on their native INT8 fast path.
+
+For a fixed adapter combination, use **Fuse GGUF LoRAs (Q8_CR Cache)** instead:
+
+1. Set **source_path** to the original FP16, BF16, or FP32 diffusion checkpoint,
+   never an already quantized GGUF.
+2. Supply absolute GGUF LoRA paths, one per line (or comma-separated), with a
+   matching comma-separated strength for each adapter.
+3. Leave **cache_directory** blank to use `gguf_lora_cache` beside the source,
+   or specify a dedicated cache directory. Select `auto` to fuse and quantize
+   on CUDA when available; select `cuda` to require it.
+4. Load the returned `gguf_path` with **Unet Loader (GGUF)**.
+
+Fusion applies each supported 2-D LoRA delta in FP32 one matrix at a time on
+the selected device, returns that matrix to CPU, and then writes a Q8_CR GGUF.
+The cache key includes SHA-256 hashes of the checkpoint and every adapter,
+adapter order and strengths, plus the quantization device setting. A matching
+cache entry is reused without loading or converting weights. Cached GGUFs are
+approximately model-sized and are deliberately not reused when any input or
+setting changes.

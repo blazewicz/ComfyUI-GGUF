@@ -4,6 +4,8 @@ import logging
 import inspect
 import collections
 import os
+import json
+import tempfile
 
 import nodes
 import comfy.sd
@@ -24,8 +26,13 @@ from .tools.convert import (
     QUANTIZATION_DEVICE_OPTIONS,
     TARGET_SIZE_Q8_TYPES,
     TARGET_SIZE_QUANT_TYPE,
+    convert_state_dict,
     convert_file,
+    load_safetensors_metadata,
+    load_state_dict,
+    resolve_quantization_device,
 )
+from .lora import cache_key, fuse_targets_into_state_dict, load_gguf_lora
 
 def update_folder_names_and_paths(key, targets=[]):
     # check for existing key
@@ -41,6 +48,7 @@ def update_folder_names_and_paths(key, targets=[]):
 # Add a custom keys for files ending in .gguf
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
+update_folder_names_and_paths("lora_gguf", ["loras"])
 
 
 class GGUFLoadProgress:
@@ -354,6 +362,246 @@ class TargetedQuantizationGGUF:
         output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
         info = f"{quantization}: {output_size_mb:.2f} MiB written to {output_path}"
         return (output_path, info)
+
+
+def _gguf_lora_path(lora_name):
+    path = folder_paths.get_full_path("loras", lora_name)
+    if path is None:
+        raise FileNotFoundError(f"GGUF LoRA does not exist: {lora_name}")
+    if not path.lower().endswith(".gguf"):
+        raise ValueError(f"GGUF LoRA Import requires a .gguf file, got {lora_name!r}.")
+    return path
+
+
+def _gguf_lora_key_map(model, clip):
+    key_map = {}
+    if model is not None:
+        key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
+    if clip is not None:
+        key_map = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, key_map)
+    return key_map
+
+
+def _remap_gguf_lora_for_comfy(targets, key_map):
+    lora = {}
+    missing = []
+    for target_name, target in targets.items():
+        candidates = (
+            target_name,
+            f"diffusion_model.{target_name}",
+            f"text_encoders.{target_name}",
+            target_name.removeprefix("diffusion_model."),
+            target_name.removeprefix("text_encoders."),
+        )
+        mapped_name = next((candidate for candidate in candidates if candidate in key_map), None)
+        if mapped_name is None:
+            missing.append(target["base_name"])
+            continue
+        lora[f"{mapped_name}.lora_A.weight"] = target["down"]
+        lora[f"{mapped_name}.lora_B.weight"] = target["up"]
+        if target["alpha"] is not None:
+            lora[f"{mapped_name}.alpha"] = torch.tensor(
+                target["alpha"], dtype=torch.float32
+            )
+    if missing:
+        raise ValueError(
+            "GGUF LoRA targets do not match the connected MODEL/CLIP: "
+            + ", ".join(sorted(missing))
+        )
+    return lora
+
+
+class GGUFLoraImport:
+    """Load standard GGUF LoRA factors through ComfyUI's normal patch mechanism."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "lora_name": (folder_paths.get_filename_list("lora_gguf"),),
+                "strength_model": (
+                    "FLOAT",
+                    {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01},
+                ),
+            },
+            "optional": {
+                "clip": ("CLIP",),
+                "strength_clip": (
+                    "FLOAT",
+                    {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP")
+    FUNCTION = "load_lora"
+    CATEGORY = "bootleg/LoRA"
+    TITLE = "Load LoRA (GGUF)"
+
+    def load_lora(self, model, lora_name, strength_model, clip=None, strength_clip=1.0):
+        path = _gguf_lora_path(lora_name)
+        _, targets, metadata = load_gguf_lora(path)
+        key_map = _gguf_lora_key_map(model, clip)
+        lora = _remap_gguf_lora_for_comfy(targets, key_map)
+        return comfy.sd.load_lora_for_models(
+            model,
+            clip,
+            lora,
+            strength_model,
+            strength_clip,
+            lora_metadata={"gguf_lora": metadata},
+        )
+
+
+def _parse_lora_paths(lora_paths):
+    paths = [
+        os.path.abspath(os.path.expanduser(path.strip()))
+        for path in lora_paths.replace(",", "\n").splitlines()
+        if path.strip()
+    ]
+    if not paths:
+        raise ValueError("Provide at least one GGUF LoRA path.")
+    for path in paths:
+        if not path.lower().endswith(".gguf"):
+            raise ValueError(f"GGUF LoRA fusion accepts only .gguf adapters, got {path!r}.")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"GGUF LoRA does not exist: {path}")
+    return paths
+
+
+def _parse_strengths(strengths, count):
+    values = [value.strip() for value in strengths.replace("\n", ",").split(",") if value.strip()]
+    if not values:
+        return [1.0] * count
+    if len(values) != count:
+        raise ValueError(
+            f"Expected {count} LoRA strength value(s), received {len(values)}."
+        )
+    try:
+        return [float(value) for value in values]
+    except ValueError as error:
+        raise ValueError("LoRA strengths must be comma-separated numbers.") from error
+
+
+class FuseGGUFLorasQ8CR:
+    """Fuse fixed GGUF LoRA combinations into a content-addressed Q8_CR cache."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "source_path": (
+                    "STRING",
+                    {"default": "", "tooltip": "FP16, BF16, or FP32 diffusion checkpoint to fuse."},
+                ),
+                "lora_paths": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                        "tooltip": "Absolute GGUF LoRA paths, one per line or comma-separated.",
+                    },
+                ),
+                "strengths": (
+                    "STRING",
+                    {
+                        "default": "1.0",
+                        "tooltip": "Comma-separated strengths in the same order as lora_paths.",
+                    },
+                ),
+                "cache_directory": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Leave empty to create gguf_lora_cache next to the source checkpoint.",
+                    },
+                ),
+                "quantization_device": (
+                    list(QUANTIZATION_DEVICE_OPTIONS),
+                    {
+                        "default": "auto",
+                        "tooltip": "Fuses and quantizes on CUDA when available; cuda requires a CUDA device.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("gguf_path", "cache_info")
+    FUNCTION = "fuse"
+    CATEGORY = "bootleg/LoRA"
+    TITLE = "Fuse GGUF LoRAs (Q8_CR Cache)"
+
+    def fuse(self, source_path, lora_paths, strengths, cache_directory, quantization_device):
+        source_path = os.path.abspath(os.path.expanduser(source_path))
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"Source checkpoint does not exist: {source_path}")
+        if source_path.lower().endswith(".gguf"):
+            raise ValueError(
+                "Fuse GGUF LoRAs requires an FP16, BF16, or FP32 checkpoint source. "
+                "Do not fuse into an already quantized GGUF."
+            )
+
+        lora_paths = _parse_lora_paths(lora_paths)
+        strengths = _parse_strengths(strengths, len(lora_paths))
+        cache_directory = os.path.abspath(
+            os.path.expanduser(cache_directory)
+            if cache_directory.strip()
+            else os.path.join(os.path.dirname(source_path), "gguf_lora_cache")
+        )
+        os.makedirs(cache_directory, exist_ok=True)
+
+        cache_id, provenance = cache_key(
+            source_path, lora_paths, strengths, quantization_device
+        )
+        output_path = os.path.join(cache_directory, f"lora-fused-{cache_id[:16]}-Q8_CR.gguf")
+        metadata_path = f"{output_path}.json"
+        if os.path.isfile(output_path) and os.path.isfile(metadata_path):
+            with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                if json.load(metadata_file) == provenance:
+                    return output_path, f"cache hit: {output_path}"
+
+        device = resolve_quantization_device(quantization_device)
+        if device.type != "cuda":
+            logging.warning(
+                "GGUF LoRA fusion is using CPU because CUDA is unavailable; "
+                "set quantization_device to cuda to require GPU fusion."
+            )
+        state_dict = load_state_dict(source_path)
+        for lora_path, strength in zip(lora_paths, strengths):
+            _, targets, _ = load_gguf_lora(lora_path)
+            fuse_targets_into_state_dict(state_dict, targets, strength, device)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=cache_directory,
+                prefix=f".{cache_id[:16]}-",
+                suffix=".gguf",
+                delete=False,
+            ) as temporary:
+                temporary_path = temporary.name
+            convert_state_dict(
+                state_dict,
+                dst_path=temporary_path,
+                source_path=source_path,
+                source_metadata=load_safetensors_metadata(source_path),
+                interact=False,
+                overwrite=True,
+                quant_type_name="Q8_CR",
+                quantization_device=quantization_device,
+            )
+            os.replace(temporary_path, output_path)
+            temporary_path = None
+            with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+                json.dump(provenance, metadata_file, indent=2, sort_keys=True)
+            return output_path, f"cache miss: fused and wrote {output_path}"
+        finally:
+            if temporary_path is not None and os.path.isfile(temporary_path):
+                os.unlink(temporary_path)
 
 
 def _require_dynamic_vram():
@@ -689,6 +937,8 @@ class QuadrupleCLIPLoaderGGUFDynamicVRAM(QuadrupleCLIPLoaderGGUF):
 
 NODE_CLASS_MAPPINGS = {
     "TargetedQuantizationGGUF": TargetedQuantizationGGUF,
+    "GGUFLoraImport": GGUFLoraImport,
+    "FuseGGUFLorasQ8CR": FuseGGUFLorasQ8CR,
     "UnetLoaderGGUF": UnetLoaderGGUF,
     "CLIPLoaderGGUF": CLIPLoaderGGUF,
     "DualCLIPLoaderGGUF": DualCLIPLoaderGGUF,
