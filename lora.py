@@ -446,35 +446,42 @@ def fuse_targets_into_state_dict(state_dict, targets, strength, device):
     fused_count = 0
     for state_key, target_entries in resolved.items():
         source = state_dict[state_key]
-        source_dtype = source.dtype
-        if source_dtype not in {torch.float16, torch.bfloat16, torch.float32, *_FP8_SOURCE_TYPES}:
-            raise ValueError(
-                f"Fusion target {state_key!r} has unsupported dtype {source.dtype}. "
-                "Fuse from an FP16, BF16, FP32, or scaled FP8 checkpoint."
-            )
-        fused = source.to(device=device, dtype=torch.float32)
-        if source_dtype in _FP8_SOURCE_TYPES:
-            scale_key = f"{state_key}_scale"
-            scale = state_dict.get(scale_key)
-            if scale is not None:
-                if scale.numel() != 1:
-                    raise ValueError(f"FP8 scale tensor {scale_key!r} must be a scalar.")
-                fused.mul_(scale.to(device=device, dtype=torch.float32))
-        for target, target_slice in target_entries:
-            target_fused = fused if target_slice is None else fused.narrow(*target_slice)
-            if target.get("kind") == "lokr":
-                w1 = target["w1"].to(device=device, dtype=torch.float32)
-                w2 = target["w2"].to(device=device, dtype=torch.float32)
-                target_fused.add_(torch.kron(w1, w2), alpha=strength)
-                del w1, w2
-            else:
-                down = target["down"].to(device=device, dtype=torch.float32)
-                up = target["up"].to(device=device, dtype=torch.float32)
-                alpha = target["alpha"] if target["alpha"] is not None else down.shape[0]
-                target_fused.add_(up.matmul(down), alpha=strength * alpha / down.shape[0])
-                del down, up
-            fused_count += 1
-        output_dtype = torch.float16 if source_dtype in _FP8_SOURCE_TYPES else source_dtype
-        state_dict[state_key] = fused.to(device="cpu", dtype=output_dtype)
-        del fused
+        state_dict[state_key], count = fuse_target_entries_into_tensor(
+            source,
+            target_entries,
+            strength,
+            device,
+            state_dict.get(f"{state_key}_scale"),
+        )
+        fused_count += count
     return fused_count
+
+
+def fuse_target_entries_into_tensor(source, target_entries, strength, device, source_scale=None):
+    """Fuse resolved LoRA targets into one tensor without retaining unrelated weights."""
+    source_dtype = source.dtype
+    if source_dtype not in {torch.float16, torch.bfloat16, torch.float32, *_FP8_SOURCE_TYPES}:
+        raise ValueError(
+            f"Fusion target has unsupported dtype {source.dtype}. "
+            "Fuse from an FP16, BF16, FP32, or scaled FP8 checkpoint."
+        )
+    fused = source.to(device=device, dtype=torch.float32)
+    if source_dtype in _FP8_SOURCE_TYPES and source_scale is not None:
+        if source_scale.numel() != 1:
+            raise ValueError("FP8 scale tensor must be a scalar.")
+        fused.mul_(source_scale.to(device=device, dtype=torch.float32))
+    for target, target_slice in target_entries:
+        target_fused = fused if target_slice is None else fused.narrow(*target_slice)
+        if target.get("kind") == "lokr":
+            w1 = target["w1"].to(device=device, dtype=torch.float32)
+            w2 = target["w2"].to(device=device, dtype=torch.float32)
+            target_fused.add_(torch.kron(w1, w2), alpha=strength)
+            del w1, w2
+        else:
+            down = target["down"].to(device=device, dtype=torch.float32)
+            up = target["up"].to(device=device, dtype=torch.float32)
+            alpha = target["alpha"] if target["alpha"] is not None else down.shape[0]
+            target_fused.add_(up.matmul(down), alpha=strength * alpha / down.shape[0])
+            del down, up
+    output_dtype = torch.float16 if source_dtype in _FP8_SOURCE_TYPES else source_dtype
+    return fused.to(device="cpu", dtype=output_dtype), len(target_entries)

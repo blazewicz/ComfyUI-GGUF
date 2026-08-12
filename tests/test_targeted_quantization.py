@@ -18,6 +18,7 @@ from tools.convert import (
     ModelMinimaxH3,
     ModelMinimaxH3VAE,
     ModelTemplate,
+    _streamed_safetensors_layout,
     convert_file,
     detect_arch,
     plan_target_size_quantization,
@@ -162,6 +163,19 @@ class Q8CRConversionDeviceTests(unittest.TestCase):
             tensor_types["blocks.0.attn.qkv_proj.weight_scale"],
             gguf.GGMLQuantizationType.F32,
         )
+
+    @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "PyTorch does not support FP8")
+    def test_streamed_layout_supports_safetensors_f8_e4m3(self):
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "fp8.safetensors"
+            save_file(
+                {"weight": torch.ones((2, 2), dtype=torch.float8_e4m3fn)},
+                str(source_path),
+            )
+            state_dict, source_keys = _streamed_safetensors_layout(str(source_path))
+
+        self.assertEqual(state_dict["weight"].dtype, torch.float8_e4m3fn)
+        self.assertEqual(source_keys["weight"], "weight")
 
 
 class MiniMaxH3VAEConversionTests(unittest.TestCase):
@@ -575,6 +589,55 @@ class OfflineLoraFusionTests(unittest.TestCase):
                 quant_type_name="F16",
                 lora_paths=[str(lora_path)],
             )
+            reader = gguf.GGUFReader(str(output_path))
+            tensor = next(
+                tensor for tensor in reader.tensors
+                if tensor.name == "blocks.0.attn.qkv_proj.weight"
+            )
+            merged = torch.from_numpy(tensor.data.copy()).view(torch.float16).reshape(
+                tuple(reversed(tensor.shape))
+            )
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+
+        self.assertTrue(torch.equal(merged[0, :2], torch.tensor([2.0, 0.0], dtype=torch.float16)))
+
+    def test_streamed_converter_merges_lora_without_loading_state_dict(self):
+        source = {
+            "video_patch_proj.weight": torch.zeros((32, 32), dtype=torch.float16),
+            "audio_patch_proj.weight": torch.zeros((32, 32), dtype=torch.float16),
+            "blocks.0.attn.qkv_proj.weight": torch.zeros((96, 32), dtype=torch.float16),
+            "final_layer.video_out.weight": torch.zeros((96, 32), dtype=torch.float16),
+        }
+        down = torch.zeros((2, 32), dtype=torch.float16)
+        down[:, 0] = 1
+        up = torch.zeros((96, 2), dtype=torch.float16)
+        up[0] = 1
+
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "minimax_h3.safetensors"
+            lora_path = Path(temp_dir) / "adapter.safetensors"
+            output_path = Path(temp_dir) / "merged.gguf"
+            save_file(source, str(source_path))
+            save_file(
+                {
+                    "blocks.0.attn.qkv_proj.lora_A.weight": down,
+                    "blocks.0.attn.qkv_proj.lora_B.weight": up,
+                    "blocks.0.attn.qkv_proj.alpha": torch.tensor(2.0),
+                },
+                str(lora_path),
+            )
+            with mock.patch("tools.convert.load_state_dict") as load_state_dict:
+                convert_file(
+                    str(source_path),
+                    str(output_path),
+                    interact=False,
+                    quant_type_name="F16",
+                    lora_paths=[str(lora_path)],
+                    streamed=True,
+                )
+            load_state_dict.assert_not_called()
             reader = gguf.GGUFReader(str(output_path))
             tensor = next(
                 tensor for tensor in reader.tensors

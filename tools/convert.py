@@ -6,17 +6,29 @@ import torch
 import logging
 import argparse
 import sys
+import tempfile
+from collections import OrderedDict
 from tqdm import tqdm
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from lora import fuse_targets_into_state_dict, load_lora, materialize_int8_source_weights
+from lora import (
+    fuse_target_entries_into_tensor,
+    fuse_targets_into_state_dict,
+    load_lora,
+    materialize_int8_source_weights,
+    resolve_fusion_targets,
+)
 
 QUANTIZATION_THRESHOLD = 1024
 REARRANGE_THRESHOLD = 512
 MAX_TENSOR_NAME_LENGTH = 127
 MAX_TENSOR_DIMS = 4
+_FP8_DTYPES = {
+    getattr(torch, "float8_e4m3fn", None),
+    getattr(torch, "float8_e5m2", None),
+} - {None}
 
 class ModelTemplate:
     arch = "invalid"  # string describing architecture
@@ -620,6 +632,11 @@ def parse_args():
         help="Merge strength for each --lora, in the same order. Defaults to 1.0 for every adapter.",
     )
     parser.add_argument(
+        "--streamed",
+        action="store_true",
+        help="Stream safetensors tensors through quantization and disk-backed GGUF staging to reduce RAM use.",
+    )
+    parser.add_argument(
         "--quant-type",
         choices=list(QUANT_TYPE_MAP.keys()),
         default=None,
@@ -730,11 +747,14 @@ def handle_tensors(
     quantization_plan=None,
     quantization_device="auto",
     progress_callback=None,
+    fp8_scales=None,
+    progress_offset=0,
+    progress_total=None,
 ):
     # Pre-collect per-tensor FP8 scales (0-dim float32 tensors named "{key}_scale").
     # These must be applied to their FP8 weight tensors before GGUF quantization.
     # The actual weight value is fp8_value * scale; ignoring scale produces wrong magnitudes.
-    fp8_scales = {
+    fp8_scales = fp8_scales if fp8_scales is not None else {
         k[:-len("_scale")]: v.item()
         for k, v in state_dict.items()
         if k.endswith("_scale") and len(v.shape) == 0 and v.dtype == torch.float32
@@ -810,7 +830,6 @@ def handle_tensors(
         for dim_size in data_shape:
             n_params *= dim_size
 
-        _FP8_DTYPES = {getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)} - {None}
         apply_quantization_rules = (
             quant_type_name == "Q8_CR"
             or old_dtype in (torch.float32, torch.bfloat16)
@@ -892,7 +911,7 @@ def handle_tensors(
             )
             writer.add_string(f"comfy.gguf.quant.{key}", json.dumps(quant_conf))
             if progress_callback is not None:
-                progress_callback("quantize", tensor_index, len(state_dict))
+                progress_callback("quantize", progress_offset + tensor_index, progress_total or len(state_dict))
             continue
 
             # Q4_PT emission is retired with its runtime backend.
@@ -921,7 +940,7 @@ def handle_tensors(
 
         writer.add_tensor(new_name, data, raw_dtype=data_qtype)
         if progress_callback is not None:
-            progress_callback("quantize", tensor_index, len(state_dict))
+            progress_callback("quantize", progress_offset + tensor_index, progress_total or len(state_dict))
 
 def convert_file(
     path,
@@ -935,7 +954,22 @@ def convert_file(
     progress_callback=None,
     lora_paths=None,
     lora_strengths=None,
+    streamed=False,
 ):
+    if streamed:
+        return convert_safetensors_streamed(
+            path,
+            dst_path=dst_path,
+            interact=interact,
+            overwrite=overwrite,
+            quant_type_name=quant_type_name,
+            max_size_mb=max_size_mb,
+            target_size_q8_type=target_size_q8_type,
+            quantization_device=quantization_device,
+            progress_callback=progress_callback,
+            lora_paths=lora_paths,
+            lora_strengths=lora_strengths,
+        )
     state_dict = load_state_dict(path, progress_callback=progress_callback)
     restored_int8_count = materialize_int8_source_weights(state_dict)
     if restored_int8_count:
@@ -973,6 +1007,176 @@ def convert_file(
         quantization_device=quantization_device,
         progress_callback=progress_callback,
     )
+
+
+def _streamed_safetensors_layout(path):
+    if not path.endswith(".safetensors"):
+        raise ValueError("--streamed supports only .safetensors source checkpoints.")
+    dtype_map = {
+        "BOOL": torch.bool,
+        "U8": torch.uint8,
+        "I8": torch.int8,
+        "I16": torch.int16,
+        "I32": torch.int32,
+        "I64": torch.int64,
+        "F16": torch.float16,
+        "BF16": torch.bfloat16,
+        "F32": torch.float32,
+        "F64": torch.float64,
+        "F8_E4M3": getattr(torch, "float8_e4m3fn", None),
+        "F8_E4M3FN": getattr(torch, "float8_e4m3fn", None),
+        "F8_E5M2": getattr(torch, "float8_e5m2", None),
+    }
+    with safe_open(path, framework="pt", device="cpu") as checkpoint:
+        source_layout = OrderedDict()
+        for key in checkpoint.keys():
+            tensor_slice = checkpoint.get_slice(key)
+            dtype_name = tensor_slice.get_dtype()
+            dtype = dtype_map.get(dtype_name)
+            if dtype is None:
+                raise ValueError(
+                    f"Streamed conversion does not support safetensors dtype {dtype_name!r} "
+                    f"for tensor {key!r}."
+                )
+            source_layout[key] = torch.empty(
+                tuple(tensor_slice.get_shape()), dtype=dtype, device="meta"
+            )
+    layout = strip_prefix(source_layout)
+    source_keys = {id(value): key for key, value in source_layout.items()}
+    return layout, {key: source_keys[id(value)] for key, value in layout.items()}
+
+
+def convert_safetensors_streamed(
+    path,
+    dst_path=None,
+    interact=True,
+    overwrite=False,
+    quant_type_name=None,
+    max_size_mb=None,
+    target_size_q8_type=DEFAULT_TARGET_SIZE_Q8_TYPE,
+    quantization_device="auto",
+    progress_callback=None,
+    lora_paths=None,
+    lora_strengths=None,
+):
+    """Convert one safetensors tensor at a time, staging GGUF payloads on disk."""
+    state_dict, source_keys = _streamed_safetensors_layout(path)
+    source_metadata = load_safetensors_metadata(path)
+    lora_paths = lora_paths or []
+    lora_strengths = lora_strengths or []
+    if lora_strengths and len(lora_strengths) != len(lora_paths):
+        raise ValueError("Provide one --lora-strength for each --lora.")
+    if not lora_strengths:
+        lora_strengths = [1.0] * len(lora_paths)
+
+    model_arch = detect_arch(state_dict)
+    logging.info(f"* Architecture detected from input: {model_arch.arch}")
+    validate_key_patterns(model_arch, state_dict)
+    if max_size_mb is not None and quant_type_name not in (None, TARGET_SIZE_QUANT_TYPE):
+        raise ValueError("--max-size-mb cannot be combined with --quant-type.")
+
+    quantization_plan = None
+    if max_size_mb is not None:
+        quant_type_name = TARGET_SIZE_QUANT_TYPE
+        quantization_plan, maximum_size, selected_size = plan_target_size_quantization(
+            state_dict, model_arch, max_size_mb, target_size_q8_type=target_size_q8_type
+        )
+        logging.info(
+            "TARGET_SIZE selected %.2f MiB from a %s baseline of %.2f MiB.",
+            selected_size / MEBIBYTE,
+            target_size_q8_type,
+            maximum_size / MEBIBYTE,
+        )
+
+    quant_type = None
+    if quantization_plan is not None:
+        ftype_name, ftype_gguf = TARGET_SIZE_QUANT_TYPE, None
+    elif quant_type_name is not None and quant_type_name in QUANT_TYPE_MAP:
+        quant_type, ftype_gguf = QUANT_TYPE_MAP[quant_type_name]
+        ftype_name = quant_type_name
+    else:
+        dtypes = [value.dtype for value in state_dict.values()]
+        main_dtype = max(set(dtypes), key=dtypes.count)
+        ftype_name = "BF16" if main_dtype == torch.bfloat16 else "F16"
+        ftype_gguf = (
+            gguf.LlamaFileType.MOSTLY_BF16
+            if main_dtype == torch.bfloat16
+            else gguf.LlamaFileType.MOSTLY_F16
+        )
+
+    if dst_path is None:
+        dst_path = f"{os.path.splitext(path)[0]}-{ftype_name}.gguf"
+    elif "{ftype}" in dst_path:
+        dst_path = dst_path.replace("{ftype}", ftype_name)
+    if os.path.isfile(dst_path) and not overwrite:
+        if interact:
+            input("Output exists enter to continue or ctrl+c to abort!")
+        else:
+            raise OSError("Output exists and overwriting is disabled!")
+
+    resolved_loras = {}
+    if lora_paths:
+        device = resolve_quantization_device(quantization_device)
+        for lora_path, strength in zip(lora_paths, lora_strengths):
+            if not os.path.isfile(lora_path):
+                raise FileNotFoundError(f"LoRA does not exist: {lora_path}")
+            _, targets, _ = load_lora(lora_path)
+            resolved = resolve_fusion_targets(state_dict, targets)
+            fused_count = sum(len(entries) for entries in resolved.values())
+            logging.info("Merged %d LoRA targets from %s.", fused_count, lora_path)
+            for key, entries in resolved.items():
+                resolved_loras.setdefault(key, []).append((entries, strength))
+
+    writer = gguf.GGUFWriter(path=None, arch=model_arch.arch, use_temp_file=True)
+    writer.temp_file = tempfile.TemporaryFile(mode="w+b")
+    writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
+    if ftype_gguf is not None:
+        writer.add_file_type(ftype_gguf)
+    if "config" in source_metadata:
+        writer.add_string("config", source_metadata["config"])
+
+    try:
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            total = len(state_dict)
+            for index, (key, layout_tensor) in enumerate(state_dict.items(), start=1):
+                data = checkpoint.get_tensor(source_keys[key])
+                if key in resolved_loras:
+                    source_scale = None
+                    scale_key = f"{key}_scale"
+                    if data.dtype in _FP8_DTYPES and scale_key in source_keys:
+                        source_scale = checkpoint.get_tensor(source_keys[scale_key])
+                    for target_entries, strength in resolved_loras[key]:
+                        data, _ = fuse_target_entries_into_tensor(
+                            data, target_entries, strength, device, source_scale
+                        )
+                        source_scale = None
+                fp8_scales = {}
+                if data.dtype in _FP8_DTYPES:
+                    scale_key = f"{key}_scale"
+                    if scale_key in source_keys:
+                        fp8_scales[key] = checkpoint.get_tensor(source_keys[scale_key]).item()
+                handle_tensors(
+                    writer,
+                    OrderedDict(((key, data),)),
+                    model_arch,
+                    quant_type=quant_type,
+                    quant_type_name=quant_type_name,
+                    quantization_plan=quantization_plan,
+                    quantization_device=quantization_device,
+                    progress_callback=progress_callback,
+                    fp8_scales=fp8_scales,
+                    progress_offset=index - 1,
+                    progress_total=total,
+                )
+                del data
+        writer.write_header_to_file(path=dst_path)
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file(progress=True)
+    finally:
+        writer.close()
+        if writer.temp_file is not None and not writer.temp_file.closed:
+            writer.temp_file.close()
+    return dst_path, model_arch
 
 
 def convert_state_dict(
@@ -1089,4 +1293,5 @@ if __name__ == "__main__":
         quantization_device=args.quantization_device,
         lora_paths=args.lora,
         lora_strengths=args.lora_strength,
+        streamed=args.streamed,
     )

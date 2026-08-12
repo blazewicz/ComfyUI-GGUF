@@ -360,6 +360,16 @@ class TargetedQuantizationGGUF:
                     },
                 ),
                 "overwrite": ("BOOLEAN", {"default": False}),
+                "streamed": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "For safetensors sources, process one tensor at a time and stage "
+                            "GGUF data on disk to reduce RAM and VRAM usage."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 "lora_paths": (
@@ -395,6 +405,7 @@ class TargetedQuantizationGGUF:
         target_size_q8_type,
         quantization_device,
         overwrite,
+        streamed=False,
         lora_paths="",
         lora_strengths="",
     ):
@@ -435,6 +446,7 @@ class TargetedQuantizationGGUF:
             progress_callback=report_progress,
             lora_paths=lora_paths,
             lora_strengths=lora_strengths,
+            streamed=streamed,
         )
         if progress["bar"] is not None:
             progress["bar"].update_absolute(progress["total"], progress["total"])

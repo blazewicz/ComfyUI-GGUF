@@ -253,6 +253,10 @@ multiple adapters and add matching `--lora-strength` values), or use the
 **lora_strengths** inputs. Both accept direct Linear LoRA factors in
 `.safetensors` (`.lora_A/.lora_B` or `.lora_down/.lora_up`) and standard GGUF
 LoRA adapters. Fusion is applied before the selected GGUF quantization.
+Enable the node's optional **streamed** input (or pass `--streamed` to
+`tools/convert.py`) for `.safetensors` sources to read, fuse, quantize, and
+stage one tensor at a time. This reduces peak RAM/VRAM use; streamed mode does
+not support pickle-based checkpoint formats.
 When a selected source target uses ComfyUI scaled FP8, its scale is applied
 before fusion and that patched target is retained as FP16 for export.
 
