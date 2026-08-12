@@ -750,6 +750,8 @@ def handle_tensors(
     fp8_scales=None,
     progress_offset=0,
     progress_total=None,
+    show_progress=True,
+    verbose=True,
 ):
     # Pre-collect per-tensor FP8 scales (0-dim float32 tensors named "{key}_scale").
     # These must be applied to their FP8 weight tensors before GGUF quantization.
@@ -759,7 +761,7 @@ def handle_tensors(
         for k, v in state_dict.items()
         if k.endswith("_scale") and len(v.shape) == 0 and v.dtype == torch.float32
     }
-    if fp8_scales:
+    if fp8_scales and verbose:
         tqdm.write(f"Found {len(fp8_scales)} FP8 per-tensor scale(s); will apply before quantization.")
 
     name_lengths = tuple(sorted(
@@ -775,11 +777,13 @@ def handle_tensors(
         raise ValueError(f"Can only handle tensor names up to {MAX_TENSOR_NAME_LENGTH} characters. Tensors exceeding the limit: {bad_list}")
     _validate_quantization_device(quantization_device)
     q8_cr_device = None
-    for tensor_index, (key, data) in enumerate(tqdm(state_dict.items()), start=1):
+    tensor_items = tqdm(state_dict.items()) if show_progress else state_dict.items()
+    for tensor_index, (key, data) in enumerate(tensor_items, start=1):
         old_dtype = data.dtype
 
         if key_matches(key, model_arch.keys_ignore):
-            tqdm.write(f"Filtering ignored key: '{key}'")
+            if verbose:
+                tqdm.write(f"Filtering ignored key: '{key}'")
             continue
 
         # comfy_quant tensors are FP8 scale factors specific to ComfyUI's custom FP8 format.
@@ -787,12 +791,14 @@ def handle_tensors(
         # Both are meaningless after GGUF re-quantization and must be dropped so the loader
         # does not try to apply them to already-GGUF-dequantized weights.
         if key.endswith(".comfy_quant") or key.endswith("_scale") and len(data.shape) == 0:
-            tqdm.write(f"Dropping FP8 scale tensor: '{key}'")
+            if verbose:
+                tqdm.write(f"Dropping FP8 scale tensor: '{key}'")
             continue
 
         # 0-dim (scalar) tensors cannot be stored in GGUF and have no meaningful weight data.
         if len(data.shape) == 0:
-            tqdm.write(f"Skipping 0-dim scalar tensor: '{key}'")
+            if verbose:
+                tqdm.write(f"Skipping 0-dim scalar tensor: '{key}'")
             continue
 
         if data.dtype == torch.bfloat16:
@@ -929,14 +935,19 @@ def handle_tensors(
         try:
             data = gguf.quants.quantize(data, data_qtype)
         except (AttributeError, gguf.QuantError) as e:
-            tqdm.write(f"falling back to F16: {e}")
+            if verbose:
+                tqdm.write(f"falling back to F16: {e}")
             data_qtype = gguf.GGMLQuantizationType.F16
             data = gguf.quants.quantize(data, data_qtype)
 
         new_name = key # do we need to rename?
 
         shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
-        tqdm.write(f"{f'%-{max_name_len + 4}s' % f'{new_name}'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
+        if verbose:
+            tqdm.write(
+                f"{f'%-{max_name_len + 4}s' % f'{new_name}'} "
+                f"{old_dtype} --> {data_qtype.name}, shape = {shape_str}"
+            )
 
         writer.add_tensor(new_name, data, raw_dtype=data_qtype)
         if progress_callback is not None:
@@ -1135,10 +1146,15 @@ def convert_safetensors_streamed(
     if "config" in source_metadata:
         writer.add_string("config", source_metadata["config"])
 
+    streamed_progress = None
+    if progress_callback is None:
+        streamed_progress = tqdm(
+            total=len(state_dict), desc="Quantizing", unit="tensor"
+        )
     try:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
             total = len(state_dict)
-            for index, (key, layout_tensor) in enumerate(state_dict.items(), start=1):
+            for index, (key, _) in enumerate(state_dict.items(), start=1):
                 data = checkpoint.get_tensor(source_keys[key])
                 if key in resolved_loras:
                     source_scale = None
@@ -1167,12 +1183,18 @@ def convert_safetensors_streamed(
                     fp8_scales=fp8_scales,
                     progress_offset=index - 1,
                     progress_total=total,
+                    show_progress=False,
+                    verbose=False,
                 )
                 del data
+                if streamed_progress is not None:
+                    streamed_progress.update()
         writer.write_header_to_file(path=dst_path)
         writer.write_kv_data_to_file()
         writer.write_tensors_to_file(progress=True)
     finally:
+        if streamed_progress is not None:
+            streamed_progress.close()
         writer.close()
         if writer.temp_file is not None and not writer.temp_file.closed:
             writer.temp_file.close()
