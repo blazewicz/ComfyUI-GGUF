@@ -25,7 +25,13 @@ from tools.convert import (
     resolve_quantization_device,
 )
 from dequant import dequantize_tensor
-from lora import fuse_targets_into_state_dict, load_gguf_lora, load_lora
+from lora import (
+    fuse_targets_into_state_dict,
+    load_gguf_lora,
+    load_lora,
+    materialize_int8_source_weights,
+    resolve_fusion_targets,
+)
 
 
 def load_gguf_loader():
@@ -40,29 +46,6 @@ def load_gguf_loader():
     import sys
     sys.modules[package_name] = module
     sys.modules[f"{package_name}.loader"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_nodes_module():
-    nodes_path = Path(__file__).parents[1] / "nodes.py"
-    package_name = "comfyui_gguf_nodes_test"
-    import sys
-    comfy_root = str(nodes_path.parents[2])
-    if comfy_root in sys.path:
-        sys.path.remove(comfy_root)
-    sys.path.insert(0, comfy_root)
-    existing_nodes = sys.modules.get("nodes")
-    if existing_nodes is not None and Path(getattr(existing_nodes, "__file__", "")).resolve() == nodes_path:
-        del sys.modules["nodes"]
-    spec = importlib.util.spec_from_file_location(
-        f"{package_name}.nodes",
-        nodes_path,
-        submodule_search_locations=[str(nodes_path.parent)],
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[package_name] = module
-    sys.modules[f"{package_name}.nodes"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -123,13 +106,14 @@ class Q8CRConversionDeviceTests(unittest.TestCase):
                 resolve_quantization_device("cuda")
 
     def test_cpu_quantization_stays_on_cpu(self):
-        qdata, scale, _, _ = quantize_int8_convrot(
+        qdata, scale, quant_conf, _ = quantize_int8_convrot(
             torch.arange(256, dtype=torch.float32).reshape(1, 256),
             device=torch.device("cpu"),
         )
 
         self.assertEqual(qdata.device.type, "cpu")
         self.assertEqual(scale.device.type, "cpu")
+        self.assertTrue(quant_conf["weight_rotated"])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
     def test_cuda_quantization_has_cpu_equivalent_decode_error(self):
@@ -299,64 +283,79 @@ class GGUFLoraTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertTrue(torch.equal(state_dict["blocks.0.attn.qkv_proj.weight"], expected))
 
+    def test_restores_per_row_scaled_int8_source_weights(self):
+        state_dict = {
+            "blocks.0.attn.qkv_proj.weight": torch.tensor(
+                [[10, -20], [30, -40]], dtype=torch.int8
+            ),
+            "blocks.0.attn.qkv_proj.weight_scale": torch.tensor([0.1, 0.01]),
+        }
 
-class FusedLoraCacheTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.node_module = load_nodes_module()
+        restored_count = materialize_int8_source_weights(state_dict)
 
-    def test_source_model_list_includes_standard_and_gguf_models(self):
-        with mock.patch.object(
-            self.node_module.folder_paths,
-            "get_filename_list",
-            side_effect=lambda folder: {
-                "diffusion_models": ["base.safetensors"],
-                "unet_gguf": ["base.gguf"],
-            }[folder],
-        ):
-            self.assertEqual(
-                self.node_module._get_fuse_source_names(),
-                ["base.gguf", "base.safetensors"],
+        self.assertEqual(restored_count, 1)
+        self.assertNotIn("blocks.0.attn.qkv_proj.weight_scale", state_dict)
+        self.assertEqual(state_dict["blocks.0.attn.qkv_proj.weight"].dtype, torch.float16)
+        self.assertTrue(
+            torch.equal(
+                state_dict["blocks.0.attn.qkv_proj.weight"],
+                torch.tensor([[1.0, -2.0], [0.3, -0.4]], dtype=torch.float16),
             )
+        )
 
-    def test_cache_path_is_fixed_below_diffusion_models(self):
-        with mock.patch.object(self.node_module.folder_paths, "models_dir", "/models"):
-            self.assertEqual(
-                self.node_module._fused_cache_directory(),
-                os.path.join("/models", "diffusion_models", "fused_cache"),
+    def test_restores_convrot_int8_source_weights(self):
+        source = torch.tensor(
+            [[2.0, 2.0, 2.0, 2.0], [2.0, -2.0, 2.0, -2.0]],
+            dtype=torch.float32,
+        )
+        qdata, scale, quant_conf, _ = quantize_int8_convrot(
+            source, convrot_groupsize=4, device=torch.device("cpu")
+        )
+        state_dict = {
+            "blocks.0.proj.weight": qdata,
+            "blocks.0.proj.weight_scale": scale,
+            "blocks.0.proj.comfy_quant": torch.tensor(
+                list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8
+            ),
+        }
+
+        materialize_int8_source_weights(state_dict)
+
+        self.assertNotIn("blocks.0.proj.weight_scale", state_dict)
+        self.assertNotIn("blocks.0.proj.comfy_quant", state_dict)
+        self.assertTrue(
+            torch.equal(
+                state_dict["blocks.0.proj.weight"],
+                source.to(dtype=torch.float16),
             )
+        )
 
-    def test_rejects_rotated_q8_cr_source_weights(self):
-        with mock.patch.object(
-            self.node_module,
-            "gguf_sd_loader",
-            return_value=({"blocks.0.weight.comfy_quant": torch.tensor(0)}, {}),
-        ):
-            with self.assertRaisesRegex(ValueError, "Q8_CR GGUF"):
-                self.node_module._load_fusion_source("base.gguf")
+    def test_rejects_int8_source_weight_without_scale(self):
+        state_dict = {
+            "blocks.0.attn.qkv_proj.weight": torch.ones((2, 2), dtype=torch.int8),
+        }
 
-    def test_materializes_standard_gguf_source(self):
-        weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float16)
-        with TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "base.gguf"
-            writer = gguf.GGUFWriter(path=None, arch="minimax_h3")
-            writer.add_tensor(
-                "blocks.0.attn.qkv_proj.weight",
-                weight.numpy(),
-                raw_dtype=gguf.GGMLQuantizationType.F16,
-            )
-            writer.write_header_to_file(path=str(path))
-            writer.write_kv_data_to_file()
-            writer.write_tensors_to_file()
-            writer.close()
-            loaded, _ = self.node_module._load_fusion_source(str(path))
-            loaded_weight = loaded.pop("blocks.0.attn.qkv_proj.weight")
-            self.assertEqual(loaded_weight.dtype, torch.float16)
-            self.assertTrue(torch.equal(loaded_weight, weight))
-            del loaded_weight
-            del loaded
-            gc.collect()
+        with self.assertRaisesRegex(ValueError, "missing its scale tensor"):
+            materialize_int8_source_weights(state_dict)
 
+    def test_warns_and_skips_unmatched_lora_targets(self):
+        targets = {
+            "missing.layer": {
+                "base_name": "missing.layer.weight",
+                "down": torch.ones((1, 2)),
+                "up": torch.ones((2, 1)),
+                "alpha": 1.0,
+            }
+        }
+
+        with self.assertLogs(level="WARNING") as logs:
+            resolved = resolve_fusion_targets({}, targets)
+
+        self.assertEqual(resolved, {})
+        self.assertIn("Skipping 1 LoRA target", logs.output[0])
+
+
+class OfflineLoraFusionTests(unittest.TestCase):
     def test_imports_and_fuses_safetensors_factor_pair(self):
         down = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
         up = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
@@ -378,6 +377,144 @@ class FusedLoraCacheTests(unittest.TestCase):
         fuse_targets_into_state_dict(state_dict, targets, strength=0.5, device=torch.device("cpu"))
         expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [4.0, 6.0]])
         self.assertTrue(torch.equal(state_dict["blocks.0.attn.qkv_proj.weight"], expected))
+
+    @mock.patch(
+        "lora._comfy_model_lora_target_map",
+        return_value={
+            "transformer.single_transformer_blocks.0.attn.to_qkv_mlp_proj": (
+                "diffusion_model.single_blocks.0.linear1.weight"
+            )
+        },
+    )
+    def test_fuses_comfy_mapped_flux2_single_block_target(self, _):
+        state_dict = {
+            "double_blocks.0.img_attn.proj.weight": torch.zeros((2, 2)),
+            "single_blocks.0.linear1.weight": torch.zeros((2, 2)),
+        }
+        targets = {
+            "transformer.single_transformer_blocks.0.attn.to_qkv_mlp_proj": {
+                "base_name": (
+                    "transformer.single_transformer_blocks.0.attn."
+                    "to_qkv_mlp_proj.weight"
+                ),
+                "down": torch.eye(2),
+                "up": torch.eye(2),
+                "alpha": 2.0,
+            }
+        }
+
+        count = fuse_targets_into_state_dict(
+            state_dict, targets, strength=1.0, device=torch.device("cpu")
+        )
+
+        self.assertEqual(count, 1)
+        self.assertTrue(torch.equal(state_dict["single_blocks.0.linear1.weight"], torch.eye(2)))
+
+    @mock.patch(
+        "lora._comfy_model_lora_target_map",
+        return_value={
+            "transformer.transformer_blocks.0.attn.to_q": (
+                "diffusion_model.double_blocks.0.img_attn.qkv.weight",
+                (0, 0, 2),
+            ),
+            "transformer.transformer_blocks.0.attn.to_v": (
+                "diffusion_model.double_blocks.0.img_attn.qkv.weight",
+                (0, 4, 2),
+            ),
+        },
+    )
+    def test_fuses_comfy_mapped_qkv_slices(self, _):
+        state_dict = {
+            "double_blocks.0.img_attn.proj.weight": torch.zeros((2, 2)),
+            "single_blocks.0.linear1.weight": torch.zeros((2, 2)),
+            "double_blocks.0.img_attn.qkv.weight": torch.zeros((6, 2)),
+        }
+        targets = {
+            "transformer.transformer_blocks.0.attn.to_q": {
+                "base_name": "transformer.transformer_blocks.0.attn.to_q.weight",
+                "down": torch.eye(2),
+                "up": torch.eye(2),
+                "alpha": 2.0,
+            },
+            "transformer.transformer_blocks.0.attn.to_v": {
+                "base_name": "transformer.transformer_blocks.0.attn.to_v.weight",
+                "down": torch.eye(2),
+                "up": torch.eye(2),
+                "alpha": 2.0,
+            },
+        }
+
+        count = fuse_targets_into_state_dict(
+            state_dict, targets, strength=1.0, device=torch.device("cpu")
+        )
+
+        self.assertEqual(count, 2)
+        self.assertTrue(
+            torch.equal(
+                state_dict["double_blocks.0.img_attn.qkv.weight"],
+                torch.tensor(
+                    [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+                ),
+            )
+        )
+
+    @mock.patch(
+        "lora._comfy_model_lora_target_map",
+        return_value={
+            "transformer.transformer_blocks.0.attn.to_q": (
+                "diffusion_model.blocks.0.attn.wq.weight"
+            )
+        },
+    )
+    def test_fuses_comfy_mapped_krea2_target(self, _):
+        state_dict = {
+            "blocks.0.attn.wq.weight": torch.zeros((2, 2)),
+        }
+        targets = {
+            "transformer.transformer_blocks.0.attn.to_q": {
+                "base_name": "transformer.transformer_blocks.0.attn.to_q.weight",
+                "down": torch.eye(2),
+                "up": torch.eye(2),
+                "alpha": 2.0,
+            }
+        }
+
+        count = fuse_targets_into_state_dict(
+            state_dict, targets, strength=1.0, device=torch.device("cpu")
+        )
+
+        self.assertEqual(count, 1)
+        self.assertTrue(torch.equal(state_dict["blocks.0.attn.wq.weight"], torch.eye(2)))
+
+    def test_imports_and_fuses_direct_lokr_adapter(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "adapter.safetensors"
+            save_file(
+                {
+                    "blocks.0.proj.lokr_w1": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                    "blocks.0.proj.lokr_w2": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+                    "blocks.0.proj.alpha": torch.tensor(100.0),
+                },
+                str(path),
+            )
+            _, targets, metadata = load_lora(path)
+
+        state_dict = {"blocks.0.proj.weight": torch.zeros((4, 4))}
+        count = fuse_targets_into_state_dict(
+            state_dict, targets, strength=0.5, device=torch.device("cpu")
+        )
+
+        self.assertEqual(metadata["target_count"], 1)
+        self.assertEqual(count, 1)
+        self.assertTrue(
+            torch.equal(
+                state_dict["blocks.0.proj.weight"],
+                0.5 * torch.kron(
+                    torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                    torch.eye(2),
+                ),
+            )
+        )
 
     @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "PyTorch does not support FP8")
     def test_fuses_scaled_fp8_target_as_fp16(self):

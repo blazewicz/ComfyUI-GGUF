@@ -117,31 +117,6 @@ directly; older compatible builds use the loader's construction-time fallback.
 Validate quality and decode latency for your workflow before replacing an FP16
 VAE.
 
-### Fuse LoRAs & Load
-
-**Fuse LoRAs & Load** selects a `.safetensors` checkpoint or a
-standard GGUF diffusion model, accepts any number of enabled LoRA rows with
-individual strengths, and returns the cached Q8_CR `MODEL` directly. Add LoRA
-rows with **Add LoRA**; each compact row has an enable toggle, LoRA chooser,
-and inline strength controls.
-
-The source checkpoint is read only while creating a cache miss, then released
-before the generated GGUF model is loaded. Subsequent runs with the same base
-checkpoint, enabled LoRAs, strengths, and quantization device reuse the
-content-addressed cache. Cache files are always written below
-`ComfyUI/models/diffusion_models/fused_cache`. This node supports
-`.safetensors` and `.gguf` LoRA files. It can read FP16/BF16/F32 and standard
-GGML source GGUF files, but not Q8_CR source GGUF files: ConvRot weights cannot
-be safely restored before applying a LoRA.
-
-The compact LoRA UI is adapted from
-[rgthree-comfy's Power Lora Loader](https://github.com/rgthree/rgthree-comfy)
-(Copyright (c) 2023 Regis Gaughan, III (rgthree), MIT License). See
-`THIRD_PARTY_NOTICES.md` for the full license notice.
-
-See [Fuse LoRAs & Load documentation](web/docs/FuseAndLoadQ8CRLoras.md) for
-inputs, outputs, and cache behavior.
-
 ## Supported conversion formats
 
 The standard GGUF formats use the package's normal GGML loader path. `Q8_CR`

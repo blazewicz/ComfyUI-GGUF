@@ -11,7 +11,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from lora import fuse_targets_into_state_dict, load_lora
+from lora import fuse_targets_into_state_dict, load_lora, materialize_int8_source_weights
 
 QUANTIZATION_THRESHOLD = 1024
 REARRANGE_THRESHOLD = 512
@@ -937,6 +937,12 @@ def convert_file(
     lora_strengths=None,
 ):
     state_dict = load_state_dict(path, progress_callback=progress_callback)
+    restored_int8_count = materialize_int8_source_weights(state_dict)
+    if restored_int8_count:
+        logging.info(
+            "Restored %d scaled INT8 source weight(s) to FP16 before conversion.",
+            restored_int8_count,
+        )
     source_metadata = load_safetensors_metadata(path)
     lora_paths = lora_paths or []
     lora_strengths = lora_strengths or []

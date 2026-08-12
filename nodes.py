@@ -4,8 +4,6 @@ import logging
 import inspect
 import collections
 import os
-import json
-import tempfile
 
 import nodes
 import comfy.sd
@@ -26,36 +24,9 @@ from .tools.convert import (
     QUANTIZATION_DEVICE_OPTIONS,
     TARGET_SIZE_Q8_TYPES,
     TARGET_SIZE_QUANT_TYPE,
-    convert_state_dict,
     convert_file,
-    load_safetensors_metadata,
-    load_state_dict,
-    resolve_quantization_device,
 )
-from .lora import cache_key, fuse_targets_into_state_dict, load_gguf_lora, load_lora
-
-
-class _AnyType(str):
-    def __ne__(self, other):
-        return False
-
-
-class FlexibleOptionalInputType(dict):
-    """Accept frontend-defined optional inputs such as Power LoRA rows."""
-
-    def __init__(self, type, data=None):
-        self.type = type
-        self.data = data or {}
-        super().__init__(self.data)
-
-    def __getitem__(self, key):
-        return self.data.get(key, (self.type,))
-
-    def __contains__(self, key):
-        return True
-
-
-any_type = _AnyType("*")
+from .lora import load_gguf_lora
 
 
 def update_folder_names_and_paths(key, targets=[]):
@@ -593,163 +564,6 @@ def _parse_strengths(strengths, count):
         raise ValueError("LoRA strengths must be comma-separated numbers.") from error
 
 
-def _get_fuse_source_names():
-    return sorted(set(folder_paths.get_filename_list("diffusion_models")) | set(
-        folder_paths.get_filename_list("unet_gguf")
-    ))
-
-
-def _get_fuse_source_path(source_name):
-    for folder_name in ("diffusion_models", "unet_gguf"):
-        path = folder_paths.get_full_path(folder_name, source_name)
-        if path is not None:
-            return path
-    raise FileNotFoundError(f"Diffusion checkpoint does not exist: {source_name}")
-
-
-def _get_power_lora_paths(kwargs):
-    loras = []
-    for key, value in kwargs.items():
-        if not key.startswith("lora_") or not isinstance(value, dict):
-            continue
-        if not value.get("on", True):
-            continue
-        lora_name = value.get("lora")
-        if not lora_name:
-            continue
-        path = folder_paths.get_full_path("loras", lora_name)
-        if path is None:
-            raise FileNotFoundError(f"LoRA does not exist: {lora_name}")
-        if not path.lower().endswith((".gguf", ".safetensors")):
-            raise ValueError(
-                f"LoRA fusion accepts only .gguf or .safetensors adapters, got {lora_name!r}."
-            )
-        loras.append((path, float(value.get("strength", 1.0))))
-    if not loras:
-        raise ValueError("Enable at least one LoRA.")
-    return zip(*loras)
-
-
-def _fused_cache_directory():
-    return os.path.join(folder_paths.models_dir, "diffusion_models", "fused_cache")
-
-
-def _load_fusion_source(source_path):
-    if not source_path.lower().endswith(".gguf"):
-        return load_state_dict(source_path), load_safetensors_metadata(source_path)
-
-    state_dict, extra = gguf_sd_loader(source_path, handle_prefix=None)
-    if any(key.endswith(".comfy_quant") for key in state_dict):
-        raise ValueError(
-            "Fusing LoRAs into Q8_CR GGUF models is unsupported because ConvRot "
-            "weights cannot be safely restored to their unrotated source layout. "
-            "Select an FP16/BF16/standard-GGML base model instead."
-        )
-    for key, value in tuple(state_dict.items()):
-        if isinstance(value, GGMLTensor):
-            state_dict[key] = dequantize_tensor(value, dtype=torch.Tensor(value).dtype)
-    return state_dict, extra.get("metadata", {})
-
-
-def _fuse_loras_to_q8_cache(source_path, lora_paths, strengths, quantization_device):
-    source_path = os.path.abspath(source_path)
-    cache_directory = _fused_cache_directory()
-    os.makedirs(cache_directory, exist_ok=True)
-
-    cache_id, provenance = cache_key(
-        source_path, lora_paths, strengths, quantization_device
-    )
-    output_path = os.path.join(cache_directory, f"lora-fused-{cache_id[:16]}-Q8_CR.gguf")
-    metadata_path = f"{output_path}.json"
-    if os.path.isfile(output_path) and os.path.isfile(metadata_path):
-        with open(metadata_path, "r", encoding="utf-8") as metadata_file:
-            if json.load(metadata_file) == provenance:
-                return output_path, f"cache hit: {output_path}"
-
-    device = resolve_quantization_device(quantization_device)
-    if device.type != "cuda":
-        logging.warning(
-            "GGUF LoRA fusion is using CPU because CUDA is unavailable; "
-            "set quantization_device to cuda to require GPU fusion."
-        )
-    state_dict, source_metadata = _load_fusion_source(source_path)
-    for lora_path, strength in zip(lora_paths, strengths):
-        _, targets, _ = load_lora(lora_path)
-        fuse_targets_into_state_dict(state_dict, targets, strength, device)
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=cache_directory,
-            prefix=f".{cache_id[:16]}-",
-            suffix=".gguf",
-            delete=False,
-        ) as temporary:
-            temporary_path = temporary.name
-        convert_state_dict(
-            state_dict,
-            dst_path=temporary_path,
-            source_path=source_path,
-            source_metadata=source_metadata,
-            interact=False,
-            overwrite=True,
-            quant_type_name="Q8_CR",
-            quantization_device=quantization_device,
-        )
-        os.replace(temporary_path, output_path)
-        temporary_path = None
-        with open(metadata_path, "w", encoding="utf-8") as metadata_file:
-            json.dump(provenance, metadata_file, indent=2, sort_keys=True)
-        return output_path, f"cache miss: fused and wrote {output_path}"
-    finally:
-        if temporary_path is not None and os.path.isfile(temporary_path):
-            os.unlink(temporary_path)
-
-
-class FuseAndLoadQ8CRLoras:
-    """Fuse dynamic Power LoRA rows, cache Q8_CR output, and load the cached MODEL."""
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "source_model": (_get_fuse_source_names(),),
-                "quantization_device": (
-                    list(QUANTIZATION_DEVICE_OPTIONS),
-                    {"default": "auto"},
-                ),
-            },
-            "optional": FlexibleOptionalInputType(
-                type=any_type,
-                data={},
-            ),
-        }
-
-    RETURN_TYPES = ("MODEL", "STRING", "STRING")
-    RETURN_NAMES = ("model", "gguf_path", "cache_info")
-    FUNCTION = "fuse_and_load"
-    CATEGORY = "bootleg/LoRA"
-    TITLE = "Fuse LoRAs & Load"
-
-    def fuse_and_load(self, source_model, quantization_device, **kwargs):
-        source_path = _get_fuse_source_path(source_model)
-        lora_paths, strengths = _get_power_lora_paths(kwargs)
-        lora_paths, strengths = list(lora_paths), list(strengths)
-        output_path, cache_info = _fuse_loras_to_q8_cache(
-            source_path, lora_paths, strengths, quantization_device
-        )
-        return (
-            _load_dynamic_gguf_unet(
-                output_path,
-                disable_dynamic=not comfy.memory_management.aimdo_enabled,
-            ),
-            output_path,
-            cache_info,
-        )
-
-
 def _require_dynamic_vram():
     if not comfy.memory_management.aimdo_enabled:
         raise RuntimeError(
@@ -1084,7 +898,6 @@ class QuadrupleCLIPLoaderGGUFDynamicVRAM(QuadrupleCLIPLoaderGGUF):
 NODE_CLASS_MAPPINGS = {
     "TargetedQuantizationGGUF": TargetedQuantizationGGUF,
     "GGUFLoraImport": GGUFLoraImport,
-    "FuseAndLoadQ8CRLoras": FuseAndLoadQ8CRLoras,
     "UnetLoaderGGUF": UnetLoaderGGUF,
     "VAELoaderGGUF": VAELoaderGGUF,
     "CLIPLoaderGGUF": CLIPLoaderGGUF,
