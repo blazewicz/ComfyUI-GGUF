@@ -1,6 +1,7 @@
 import unittest
 import json
 import gc
+import os
 from collections import OrderedDict
 import importlib.util
 from pathlib import Path
@@ -39,6 +40,29 @@ def load_gguf_loader():
     import sys
     sys.modules[package_name] = module
     sys.modules[f"{package_name}.loader"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_nodes_module():
+    nodes_path = Path(__file__).parents[1] / "nodes.py"
+    package_name = "comfyui_gguf_nodes_test"
+    import sys
+    comfy_root = str(nodes_path.parents[2])
+    if comfy_root in sys.path:
+        sys.path.remove(comfy_root)
+    sys.path.insert(0, comfy_root)
+    existing_nodes = sys.modules.get("nodes")
+    if existing_nodes is not None and Path(getattr(existing_nodes, "__file__", "")).resolve() == nodes_path:
+        del sys.modules["nodes"]
+    spec = importlib.util.spec_from_file_location(
+        f"{package_name}.nodes",
+        nodes_path,
+        submodule_search_locations=[str(nodes_path.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[package_name] = module
+    sys.modules[f"{package_name}.nodes"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -274,6 +298,64 @@ class GGUFLoraTests(unittest.TestCase):
         expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [4.0, 6.0]], dtype=torch.float16)
         self.assertEqual(count, 1)
         self.assertTrue(torch.equal(state_dict["blocks.0.attn.qkv_proj.weight"], expected))
+
+
+class FusedLoraCacheTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.node_module = load_nodes_module()
+
+    def test_source_model_list_includes_standard_and_gguf_models(self):
+        with mock.patch.object(
+            self.node_module.folder_paths,
+            "get_filename_list",
+            side_effect=lambda folder: {
+                "diffusion_models": ["base.safetensors"],
+                "unet_gguf": ["base.gguf"],
+            }[folder],
+        ):
+            self.assertEqual(
+                self.node_module._get_fuse_source_names(),
+                ["base.gguf", "base.safetensors"],
+            )
+
+    def test_cache_path_is_fixed_below_diffusion_models(self):
+        with mock.patch.object(self.node_module.folder_paths, "models_dir", "/models"):
+            self.assertEqual(
+                self.node_module._fused_cache_directory(),
+                os.path.join("/models", "diffusion_models", "fused_cache"),
+            )
+
+    def test_rejects_rotated_q8_cr_source_weights(self):
+        with mock.patch.object(
+            self.node_module,
+            "gguf_sd_loader",
+            return_value=({"blocks.0.weight.comfy_quant": torch.tensor(0)}, {}),
+        ):
+            with self.assertRaisesRegex(ValueError, "Q8_CR GGUF"):
+                self.node_module._load_fusion_source("base.gguf")
+
+    def test_materializes_standard_gguf_source(self):
+        weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float16)
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "base.gguf"
+            writer = gguf.GGUFWriter(path=None, arch="minimax_h3")
+            writer.add_tensor(
+                "blocks.0.attn.qkv_proj.weight",
+                weight.numpy(),
+                raw_dtype=gguf.GGMLQuantizationType.F16,
+            )
+            writer.write_header_to_file(path=str(path))
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+            loaded, _ = self.node_module._load_fusion_source(str(path))
+            loaded_weight = loaded.pop("blocks.0.attn.qkv_proj.weight")
+            self.assertEqual(loaded_weight.dtype, torch.float16)
+            self.assertTrue(torch.equal(loaded_weight, weight))
+            del loaded_weight
+            del loaded
+            gc.collect()
 
     def test_imports_and_fuses_safetensors_factor_pair(self):
         down = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
