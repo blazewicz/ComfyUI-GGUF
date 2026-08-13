@@ -96,6 +96,21 @@ For the portable Windows distribution, use its embedded Python executable:
   --quantization-device auto
 ```
 
+### Local conversion dashboard
+
+For a local browser UI that queues conversions and shows the converter's live
+output, start the dependency-free dashboard from the `ComfyUI-GGUF` directory:
+
+```powershell
+python tools\conversion_webui.py
+```
+
+It opens `http://127.0.0.1:8189` and only listens on the local machine. Enter
+existing source and destination filesystem paths rather than uploading
+checkpoints; models remain local. The dashboard runs one conversion at a time
+to avoid competing for GPU memory or RAM. Use `--port <port>` to change the
+port, or `--no-browser` to avoid opening a browser automatically.
+
 Place the resulting GGUF in `ComfyUI/models/unet` or
 `ComfyUI/models/diffusion_models`, then load it with **Unet Loader (GGUF)**.
 
