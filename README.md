@@ -42,6 +42,7 @@ Pre-quantized models (🍴 icon on ones added by this fork):
 - [Krea 2 (Both Turbo and Raw)](https://huggingface.co/molbal/krea2-gguf) 🍴
 - [Ideogram 4](https://huggingface.co/molbal/ideogram-4-gguf) 🍴
 - [MiniMax H3](https://huggingface.co/molbal/MiniMax-H3-GGUF) 🍴
+- MiniMax Music 3 (convert locally)
 - LTX 2.5 transformer and latent spatial/temporal upscalers (convert locally)
 
 
@@ -57,7 +58,7 @@ Initial support for quantizing T5 has also been added recently, these can be use
 
 See the instructions in the [tools](https://github.com/city96/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants.
 
-## Converting Krea 2, Ideogram 4, and Minimax M3 models
+## Converting Krea 2, Ideogram 4, MiniMax H3, and MiniMax Music 3 models
 
 The converter detects supported Krea 2, Ideogram 4, and native Minimax M3
 (`minimax_h3`) checkpoints directly.
@@ -114,6 +115,28 @@ port, or `--no-browser` to avoid opening a browser automatically.
 
 Place the resulting GGUF in `ComfyUI/models/unet` or
 `ComfyUI/models/diffusion_models`, then load it with **Unet Loader (GGUF)**.
+
+### MiniMax Music 3
+
+MiniMax Music 3 uses a DiT and a separate pruned autoregressive text encoder.
+Both are supported by **Unet Loader (GGUF)** and **CLIPLoader (GGUF)**,
+respectively. This requires ComfyUI support introduced by commit
+[`efd4e951a00e85bd92e79f1d685427912b0dad5e`](https://github.com/Comfy-Org/ComfyUI/commit/efd4e951a00e85bd92e79f1d685427912b0dad5e)
+or a newer build; it supplies the MiniMax Music 3 runtime, text encoder, and
+audio nodes.
+
+Convert the supplied files separately:
+
+```powershell
+python tools\convert.py --src C:\Users\ASUS\Downloads\minimax_music3_dit_fp32.safetensors --dst C:\Users\ASUS\Downloads\minimax_music3_dit-Q8_CR.gguf --quant-type Q8_CR
+python tools\convert.py --src C:\Users\ASUS\Downloads\minimax_music3_text_encoder_pruned_bf16.safetensors --dst C:\Users\ASUS\Downloads\minimax_music3_text_encoder_pruned_bf16-Q8_CR.gguf --quant-type Q8_CR
+```
+
+Put the DiT GGUF in `ComfyUI/models/diffusion_models` (or `models/unet`) and
+the text-encoder GGUF in `ComfyUI/models/text_encoders` (or `models/clip`).
+Use ComfyUI's **MiniMax Music3** CLIP type. The Music3 lookup embeddings and
+DiT convolutional paths retain their source precision; `Q8_CR` applies only
+to eligible Linear weights.
 
 ### MiniMax H3 video VAE
 

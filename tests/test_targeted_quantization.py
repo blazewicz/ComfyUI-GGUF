@@ -19,6 +19,8 @@ from tools.convert import (
     ModelLTXVUpsampler,
     ModelMinimaxH3,
     ModelMinimaxH3VAE,
+    ModelMiniMaxMusic3DiT,
+    ModelMiniMaxMusic3TextEncoder,
     ModelTemplate,
     _streamed_safetensors_layout,
     convert_file,
@@ -241,6 +243,121 @@ class MiniMaxH3VAEConversionTests(unittest.TestCase):
         self.assertEqual(
             conv3d_shape,
             (2, 2, 3, 3, 3),
+        )
+
+
+class MiniMaxMusic3ConversionTests(unittest.TestCase):
+    def test_detects_dit_from_music_specific_conditioning_and_attention_keys(self):
+        state_dict = {
+            "cond_layer_logits": torch.ones(8),
+            "latent_conditioners.0.weight": torch.ones((2, 2, 1)),
+            "diffusion_transformer.preprocess_conv.weight": torch.ones((2, 2, 1)),
+            "diffusion_transformer.postprocess_conv.weight": torch.ones((2, 2, 1)),
+            "diffusion_transformer.timestep_features.weight": torch.ones((128, 1)),
+            "diffusion_transformer.transformer.rotary_pos_emb.inv_freq": torch.ones(16),
+            "diffusion_transformer.transformer.project_in.weight": torch.ones((64, 64)),
+            "diffusion_transformer.transformer.layers.0.self_attn.to_qkv.weight": torch.ones((192, 64)),
+        }
+
+        self.assertIsInstance(detect_arch(state_dict), ModelMiniMaxMusic3DiT)
+
+    def test_detects_pruned_text_encoder_from_audio_and_qwen_keys(self):
+        state_dict = {
+            "model.embed_tokens_prefill.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.embed_tokens_audio.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.audio_extra_embedding.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.audio_decoder.pos_embedding.weight": torch.ones((16, 32), dtype=torch.bfloat16),
+            "model.lm_head_pruned.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.audio_decoder.audio_heads.0.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.layers.0.self_attn.qkv_proj.weight": torch.ones((96, 32), dtype=torch.bfloat16),
+        }
+
+        self.assertIsInstance(detect_arch(state_dict), ModelMiniMaxMusic3TextEncoder)
+
+    def test_q8_cr_preserves_dit_convolutions(self):
+        state_dict = {
+            "cond_layer_logits": torch.ones(8),
+            "latent_conditioners.0.weight": torch.ones((2, 2, 1)),
+            "diffusion_transformer.preprocess_conv.weight": torch.ones((2, 2, 1)),
+            "diffusion_transformer.postprocess_conv.weight": torch.ones((2, 2, 1)),
+            "diffusion_transformer.timestep_features.weight": torch.ones((128, 1)),
+            "diffusion_transformer.transformer.rotary_pos_emb.inv_freq": torch.ones(16),
+            "diffusion_transformer.transformer.project_in.weight": torch.ones((64, 64)),
+            "diffusion_transformer.transformer.layers.0.self_attn.to_qkv.weight": torch.ones((192, 64)),
+        }
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "minimax_music3_dit-Q8_CR.gguf"
+            converted_path, model_arch = convert_state_dict(
+                state_dict,
+                str(output_path),
+                quant_type_name="Q8_CR",
+                quantization_device="cpu",
+            )
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            loaded, extra = load_gguf_loader().gguf_sd_loader(converted_path, handle_prefix=None)
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+            del loaded
+
+        self.assertIsInstance(model_arch, ModelMiniMaxMusic3DiT)
+        self.assertEqual(extra["arch_str"], "minimax_music3")
+        self.assertEqual(
+            tensor_types["diffusion_transformer.transformer.project_in.weight"],
+            gguf.GGMLQuantizationType.I8,
+        )
+        self.assertEqual(
+            tensor_types["latent_conditioners.0.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+
+    def test_q8_cr_preserves_text_embeddings(self):
+        state_dict = {
+            "model.embed_tokens_prefill.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.embed_tokens_audio.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.audio_extra_embedding.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.audio_decoder.pos_embedding.weight": torch.ones((16, 32), dtype=torch.bfloat16),
+            "model.lm_head_pruned.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.audio_decoder.audio_heads.0.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.layers.0.self_attn.qkv_proj.weight": torch.ones((96, 32), dtype=torch.bfloat16),
+        }
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "minimax_music3_text_encoder.safetensors"
+            output_path = Path(temp_dir) / "minimax_music3_text_encoder-Q8_CR.gguf"
+            save_file(state_dict, str(source_path))
+            converted_path, model_arch = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="Q8_CR",
+                quantization_device="cpu",
+                streamed=True,
+            )
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            loaded, extra = load_gguf_loader().gguf_sd_loader(
+                converted_path,
+                handle_prefix=None,
+                is_text_model=True,
+            )
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+            del loaded
+            gc.collect()
+
+        self.assertIsInstance(model_arch, ModelMiniMaxMusic3TextEncoder)
+        self.assertEqual(extra["arch_str"], "minimax_music3")
+        self.assertEqual(
+            tensor_types["model.embed_tokens_prefill.weight"],
+            gguf.GGMLQuantizationType.BF16,
+        )
+        self.assertEqual(
+            tensor_types["model.layers.0.self_attn.qkv_proj.weight"],
+            gguf.GGMLQuantizationType.I8,
         )
 
 

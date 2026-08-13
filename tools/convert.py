@@ -300,9 +300,53 @@ class ModelMinimaxH3VAE(ModelTemplate):
     ]
 
 
+class ModelMiniMaxMusic3DiT(ModelTemplate):
+    arch = "minimax_music3"
+    keys_detect = [
+        (
+            "cond_layer_logits",
+            "latent_conditioners.0.weight",
+            "diffusion_transformer.transformer.layers.0.self_attn.to_qkv.weight",
+            "diffusion_transformer.transformer.project_in.weight",
+        )
+    ]
+    # These are Fourier/rotary buffers and 1x1 convolutional paths. The
+    # MiniMax Music3 runtime is FP32 and has no low-bit convolution kernel.
+    keys_hiprec = [
+        "cond_layer_",
+        "latent_conditioners.",
+        "preprocess_conv.",
+        "postprocess_conv.",
+        "timestep_features",
+        "rotary_pos_emb",
+    ]
+
+
+class ModelMiniMaxMusic3TextEncoder(ModelTemplate):
+    arch = "minimax_music3"
+    keys_detect = [
+        (
+            "model.embed_tokens_prefill.weight",
+            "model.embed_tokens_audio.weight",
+            "model.lm_head_pruned.weight",
+            "model.audio_decoder.audio_heads.0.weight",
+            "model.layers.0.self_attn.qkv_proj.weight",
+        )
+    ]
+    # The native Q8_CR path accelerates Linear only. Keep lookup tables in
+    # BF16 so ComfyUI's Embedding operations retain their normal behavior.
+    keys_noquant = [
+        "embed_tokens_prefill",
+        "embed_tokens_audio",
+        "audio_extra_embedding",
+        "audio_decoder.pos_embedding",
+    ]
+
+
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
              ModelLTXV, ModelLTXVUpsampler, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
-             ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE]
+             ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE,
+             ModelMiniMaxMusic3DiT, ModelMiniMaxMusic3TextEncoder]
 
 def is_model_arch(model, state_dict):
     # check if model is correct
@@ -697,9 +741,24 @@ def parse_args():
     return args
 
 def strip_prefix(state_dict):
+    # MiniMax Music3's standalone text encoder owns the `model.` namespace.
+    # It is not a ComfyUI wrapper prefix: the upstream runtime loads
+    # `model.embed_tokens_*`, `model.layers.*`, and `model.audio_decoder.*`.
+    minimax_music3_text_encoder = all(
+        key in state_dict
+        for key in (
+            "model.embed_tokens_prefill.weight",
+            "model.embed_tokens_audio.weight",
+            "model.lm_head_pruned.weight",
+            "model.audio_decoder.audio_heads.0.weight",
+        )
+    )
+
     # prefix for mixed state dict
     prefix = None
     for pfx in ["model.diffusion_model.", "model."]:
+        if pfx == "model." and minimax_music3_text_encoder:
+            continue
         if any([x.startswith(pfx) for x in state_dict.keys()]):
             prefix = pfx
             break
@@ -896,6 +955,7 @@ def handle_tensors(
             quant_type_name == "Q8_CR"
             and n_dims > 1
             and n_dims != 2
+            and not key_matches(key, model_arch.keys_hiprec)
             and not key_matches(key, model_arch.keys_noquant)
         ):
             # Custom native layouts only represent Linear matrices.
