@@ -283,6 +283,11 @@ class GGMLOps(comfy.ops.manual_cast):
             weight, bias = self.cast_bias_weight(input)
             return self._conv_forward(input, weight, bias)
 
+    class Conv3d(GGMLLayer, comfy.ops.manual_cast.Conv3d):
+        def forward_ggml_cast_weights(self, input):
+            weight, bias = self.cast_bias_weight(input)
+            return self._conv_forward(input, weight, bias)
+
     class Embedding(GGMLLayer, comfy.ops.manual_cast.Embedding):
         def forward_ggml_cast_weights(self, input, out_dtype=None):
             output_dtype = out_dtype

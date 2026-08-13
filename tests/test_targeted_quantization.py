@@ -15,11 +15,14 @@ from safetensors.torch import save_file
 
 from tools.convert import (
     MEBIBYTE,
+    ModelLTXV,
+    ModelLTXVUpsampler,
     ModelMinimaxH3,
     ModelMinimaxH3VAE,
     ModelTemplate,
     _streamed_safetensors_layout,
     convert_file,
+    convert_state_dict,
     detect_arch,
     plan_target_size_quantization,
     quantize_int8_convrot,
@@ -239,6 +242,72 @@ class MiniMaxH3VAEConversionTests(unittest.TestCase):
             conv3d_shape,
             (2, 2, 3, 3, 3),
         )
+
+
+class LTX25ConversionTests(unittest.TestCase):
+    def test_detects_ltx25_audio_video_transformer(self):
+        state_dict = {
+            "adaln_single.emb.timestep_embedder.linear_2.weight": torch.ones((32, 16)),
+            "audio_adaln_single.linear.weight": torch.ones((32, 16)),
+            "transformer_blocks.27.scale_shift_table": torch.ones((6, 32)),
+        }
+
+        self.assertIsInstance(detect_arch(state_dict), ModelLTXV)
+
+    def test_converts_temporal_upscaler_without_quantizing_conv3d(self):
+        state_dict = {
+            "initial_conv.weight": torch.ones((32, 16, 3, 3, 3), dtype=torch.bfloat16),
+            "post_upsample_res_blocks.0.conv2.bias": torch.ones(32, dtype=torch.bfloat16),
+            "upsampler.0.weight": torch.ones((64, 32, 3, 3, 3), dtype=torch.bfloat16),
+            "final_conv.weight": torch.ones((16, 32, 3, 3, 3), dtype=torch.bfloat16),
+        }
+        metadata = {
+            "config": json.dumps(
+                {
+                    "_class_name": "LatentUpsampler",
+                    "in_channels": 16,
+                    "mid_channels": 32,
+                    "num_blocks_per_stage": 1,
+                    "dims": 3,
+                    "spatial_upsample": False,
+                    "temporal_upsample": True,
+                }
+            )
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "ltx25-temporal-upscaler-Q8_CR.gguf"
+            converted_path, model_arch = convert_state_dict(
+                state_dict,
+                str(output_path),
+                source_metadata=metadata,
+                quant_type_name="Q8_CR",
+                quantization_device="cpu",
+            )
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            loader = load_gguf_loader()
+            loaded, extra = loader.gguf_sd_loader(converted_path, handle_prefix=None)
+            restored_shape = tuple(
+                loaded["upsampler.0.weight"].shape
+            )
+            loaded_arch = extra["arch_str"]
+            config_dims = json.loads(extra["metadata"]["config"])["dims"]
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+            del loaded
+            del extra
+            gc.collect()
+
+        self.assertIsInstance(model_arch, ModelLTXVUpsampler)
+        self.assertEqual(loaded_arch, "ltxv_upscaler")
+        self.assertEqual(
+            tensor_types["upsampler.0.weight"], gguf.GGMLQuantizationType.BF16
+        )
+        self.assertEqual(restored_shape, (64, 32, 3, 3, 3))
+        self.assertEqual(config_dims, 3)
 
 
 class GGUFLoraTests(unittest.TestCase):
@@ -776,10 +845,10 @@ class MinimaxH3DetectionTests(unittest.TestCase):
 
     def test_converts_to_minimax_h3_gguf_with_full_precision_adaln_table(self):
         state_dict = {
-            "video_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
-            "audio_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
-            "blocks.0.attn.qkv_proj.weight": torch.ones((96, 32), dtype=torch.float32),
-            "final_layer.video_out.weight": torch.ones((96, 32), dtype=torch.float32),
+            "video_patch_proj.weight": torch.ones((32, 32), dtype=torch.float16),
+            "audio_patch_proj.weight": torch.ones((32, 32), dtype=torch.float16),
+            "blocks.0.attn.qkv_proj.weight": torch.ones((96, 32), dtype=torch.float16),
+            "final_layer.video_out.weight": torch.ones((96, 32), dtype=torch.float16),
             "adaln_t_table": torch.ones((32, 32), dtype=torch.float32),
         }
 

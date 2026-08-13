@@ -9,6 +9,7 @@ import nodes
 import comfy.sd
 import comfy.lora
 import comfy.float
+import comfy.ops
 import comfy.utils
 import comfy.model_patcher
 import comfy.model_management
@@ -45,6 +46,7 @@ update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 update_folder_names_and_paths("lora_gguf", ["loras"])
 update_folder_names_and_paths("vae_gguf", ["vae"])
+update_folder_names_and_paths("latent_upscale_models_gguf", ["latent_upscale_models"])
 
 
 class GGUFLoadProgress:
@@ -296,6 +298,61 @@ class VAELoaderGGUF:
                 minimax_vae.ops = original_operations
         vae.throw_exception_if_invalid()
         return (vae,)
+
+
+class LTXVLatentUpscaleModelLoaderGGUF:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model_name": (
+                    folder_paths.get_filename_list("latent_upscale_models_gguf"),
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT_UPSCALE_MODEL",)
+    FUNCTION = "load_model"
+    CATEGORY = "bootleg"
+    TITLE = "LTXV Latent Upscale Model Loader (GGUF)"
+
+    def load_model(self, model_name):
+        model_path = folder_paths.get_full_path(
+            "latent_upscale_models_gguf", model_name
+        )
+        progress = GGUFLoadProgress([model_path])
+        state_dict, extra = gguf_sd_loader(
+            model_path,
+            handle_prefix=None,
+            progress_callback=progress.callback_for(model_path),
+        )
+        progress.complete_file(model_path)
+
+        if extra["arch_str"] != "ltxv_upscaler":
+            raise ValueError(
+                "LTXV Latent Upscale Model Loader (GGUF) requires an LTX 2.5 "
+                "latent upscaler GGUF file."
+            )
+        config_json = extra["metadata"].get("config")
+        if config_json is None:
+            raise ValueError("LTX 2.5 latent upscaler GGUF is missing its config metadata.")
+
+        from comfy.ldm.lightricks.latent_upsampler import LatentUpsampler
+
+        config = json.loads(config_json)
+        model = LatentUpsampler.from_config(config, operations=GGMLOps)
+        model_dtype = comfy.model_management.vae_dtype(
+            allowed_dtypes=[torch.bfloat16, torch.float32]
+        )
+        model = model.to(dtype=model_dtype)
+        comfy.model_management.archive_model_dtypes(model)
+        model_patcher = comfy.model_patcher.CoreModelPatcher(
+            model,
+            load_device=comfy.model_management.get_torch_device(),
+            offload_device=comfy.model_management.unet_offload_device(),
+        )
+        model.load_state_dict(state_dict, assign=model_patcher.is_dynamic())
+        return (model_patcher,)
 
 
 class TargetedQuantizationGGUF:
@@ -912,6 +969,7 @@ NODE_CLASS_MAPPINGS = {
     "GGUFLoraImport": GGUFLoraImport,
     "UnetLoaderGGUF": UnetLoaderGGUF,
     "VAELoaderGGUF": VAELoaderGGUF,
+    "LTXVLatentUpscaleModelLoaderGGUF": LTXVLatentUpscaleModelLoaderGGUF,
     "CLIPLoaderGGUF": CLIPLoaderGGUF,
     "DualCLIPLoaderGGUF": DualCLIPLoaderGGUF,
     "TripleCLIPLoaderGGUF": TripleCLIPLoaderGGUF,

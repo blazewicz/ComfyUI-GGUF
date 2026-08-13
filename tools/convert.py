@@ -176,6 +176,21 @@ class ModelLTXV(ModelTemplate):
         "to_gate_logits",
     ]
 
+class ModelLTXVUpsampler(ModelTemplate):
+    arch = "ltxv_upscaler"
+    preserve_nd_shapes = True
+    keys_detect = [
+        (
+            "initial_conv.weight",
+            "post_upsample_res_blocks.0.conv2.bias",
+            "upsampler.0.weight",
+            "final_conv.weight",
+        )
+    ]
+    # LTX 2.5 latent upscalers are entirely convolutional. No GGUF runtime
+    # quantized convolution path exists, so retain the source precision.
+    keys_noquant = ["^"]
+
 class ModelSDXL(ModelTemplate):
     arch = "sdxl"
     shape_fix = True
@@ -286,7 +301,7 @@ class ModelMinimaxH3VAE(ModelTemplate):
 
 
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
-             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
+             ModelLTXV, ModelLTXVUpsampler, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
              ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE]
 
 def is_model_arch(model, state_dict):
@@ -634,7 +649,10 @@ def parse_args():
     parser.add_argument(
         "--streamed",
         action="store_true",
-        help="Stream safetensors tensors through quantization and disk-backed GGUF staging to reduce RAM use.",
+        help=(
+            "Stream safetensors tensors through quantization and continuously flush "
+            "disk-backed GGUF payload staging to reduce RAM use."
+        ),
     )
     parser.add_argument(
         "--quant-type",
@@ -838,6 +856,10 @@ def handle_tensors(
 
         apply_quantization_rules = (
             quant_type_name == "Q8_CR"
+            or (
+                quant_type_name in QUANT_TYPE_MAP
+                and quant_type_name not in {"F16", "BF16"}
+            )
             or old_dtype in (torch.float32, torch.bfloat16)
             or old_dtype in _FP8_DTYPES
         )
@@ -870,7 +892,12 @@ def handle_tensors(
             elif quant_type is not None:
                 data_qtype = quant_type
 
-        if quant_type_name == "Q8_CR" and n_dims > 1 and n_dims != 2:
+        if (
+            quant_type_name == "Q8_CR"
+            and n_dims > 1
+            and n_dims != 2
+            and not key_matches(key, model_arch.keys_noquant)
+        ):
             # Custom native layouts only represent Linear matrices.
             data_qtype = gguf.GGMLQuantizationType.F16
         # Q4_PT layout restrictions are retained with
@@ -1070,7 +1097,7 @@ def convert_safetensors_streamed(
     lora_paths=None,
     lora_strengths=None,
 ):
-    """Convert one safetensors tensor at a time, staging GGUF payloads on disk."""
+    """Convert one safetensors tensor at a time, flushing GGUF payload staging to disk."""
     state_dict, source_keys = _streamed_safetensors_layout(path)
     source_metadata = load_safetensors_metadata(path)
     lora_paths = lora_paths or []
@@ -1187,6 +1214,11 @@ def convert_safetensors_streamed(
                     verbose=False,
                 )
                 del data
+                # A GGUF header requires the complete tensor table, so the final
+                # file can only be assembled after conversion. Keep the payload
+                # staging file durable and growing throughout the conversion.
+                if writer.temp_file is not None:
+                    writer.temp_file.flush()
                 if streamed_progress is not None:
                     streamed_progress.update()
         writer.write_header_to_file(path=dst_path)

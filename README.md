@@ -42,6 +42,7 @@ Pre-quantized models (🍴 icon on ones added by this fork):
 - [Krea 2 (Both Turbo and Raw)](https://huggingface.co/molbal/krea2-gguf) 🍴
 - [Ideogram 4](https://huggingface.co/molbal/ideogram-4-gguf) 🍴
 - [MiniMax H3](https://huggingface.co/molbal/MiniMax-H3-GGUF) 🍴
+- LTX 2.5 transformer and latent spatial/temporal upscalers (convert locally)
 
 
 > [!IMPORTANT]  
@@ -131,6 +132,28 @@ point. Current ComfyUI versions use injected MiniMax H3 VAE operations
 directly; older compatible builds use the loader's construction-time fallback.
 Validate quality and decode latency for your workflow before replacing an FP16
 VAE.
+
+### LTX 2.5 video and latent upscalers
+
+LTX 2.5 audio-video transformer checkpoints are supported by **Unet Loader
+(GGUF)** on ComfyUI builds that include the LTXAV runtime. The LTX 2.5 latent
+spatial and temporal upscalers are supported by **LTXV Latent Upscale Model
+Loader (GGUF)**; use their output with ComfyUI's **LTXV Latent Upsampler**
+node. This requires a ComfyUI build that includes
+`comfy.ldm.lightricks.latent_upsampler.LatentUpsampler`.
+
+Convert the supplied model files with:
+
+```powershell
+python tools\convert.py --src C:\Users\ASUS\Downloads\ltx-2.5-22b-distilled-transformer-bf16.safetensors --dst C:\Users\ASUS\Downloads\ltx-2.5-22b-distilled-transformer-Q8_CR.gguf --quant-type Q8_CR
+python tools\convert.py --src C:\Users\ASUS\Downloads\ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors --dst C:\Users\ASUS\Downloads\ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.gguf
+python tools\convert.py --src C:\Users\ASUS\Downloads\ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors --dst C:\Users\ASUS\Downloads\ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.gguf
+```
+
+Place the transformer GGUF in `ComfyUI/models/diffusion_models` or
+`ComfyUI/models/unet`, and the upscaler GGUFs in
+`ComfyUI/models/latent_upscale_models`. The upscalers retain BF16 convolution
+weights; they do not use low-bit convolution quantization.
 
 ## Supported conversion formats
 
