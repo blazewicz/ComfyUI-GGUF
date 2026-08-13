@@ -104,7 +104,11 @@ class GGMLTensor(torch.Tensor):
     def dtype(self):
         qtype = getattr(self, "tensor_type", None)
         if qtype in GGMLLayer.torch_compatible_tensor_types:
-            return torch.Tensor(self).dtype
+            # NOTE: use the base-class descriptor instead of torch.Tensor(self):
+            # constructing a Tensor from an inference-mode tensor raises
+            # "Inference tensors do not track version counter" (hit via
+            # low_vram_patch_estimate_vram on bias keys when LoRAs patch biases)
+            return torch.Tensor.dtype.__get__(self)
         return _infer_compute_dtype(qtype, getattr(self, "compute_dtype", None))
 
     @property
