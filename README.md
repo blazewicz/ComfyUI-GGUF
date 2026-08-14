@@ -67,6 +67,11 @@ Pruned Qwen3-VL-32B GGUFs, including IQ2/IQ3 variants, are loaded with
 ComfyUI build containing MiniMax H3 support
 (`57500fc5bc92566a63f2046824f522cd55c335ca` or newer).
 
+For Image-to-Video or Reference-to-Video, download the matching
+`*-mmproj-BF16.gguf` file and place it beside the text encoder. The loader
+matches the shared filename prefix and loads its Qwen3-VL vision tower
+automatically. Text-only workflows do not need the mmproj file.
+
 ## Converting Krea 2, Ideogram 4, MiniMax H3, and MiniMax Music 3 models
 
 The converter detects supported Krea 2, Ideogram 4, and native Minimax M3

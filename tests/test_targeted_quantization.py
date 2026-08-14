@@ -888,6 +888,10 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
                 },
                 {"arch_str": "qwen3vl"},
             ),
+        ), mock.patch.object(
+            self.loader,
+            "gguf_mmproj_loader",
+            return_value={},
         ):
             state_dict = self.loader.gguf_clip_loader("qwen3-vl-pruned.gguf")
 
@@ -895,6 +899,50 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
             state_dict["visual.deepstack_merger_list.0.norm.weight"].shape,
             (4608,),
         )
+
+    def test_pruned_32b_clip_loader_maps_matching_mmproj_to_visual_tower(self):
+        with mock.patch.object(
+            self.loader,
+            "gguf_sd_loader",
+            return_value=(
+                {
+                    "model.layers.0.input_layernorm.weight": torch.zeros(5120),
+                    "model.layers.49.self_attn.q_proj.weight": torch.zeros(1),
+                },
+                {"arch_str": "qwen3vl"},
+            ),
+        ), mock.patch.object(
+            self.loader,
+            "gguf_mmproj_loader",
+            return_value={
+                "model.visual.deepstack_merger_list.0.norm.weight": torch.ones(4608),
+            },
+        ):
+            state_dict = self.loader.gguf_clip_loader("qwen3-vl-pruned.gguf")
+
+        self.assertIn("visual.deepstack_merger_list.0.norm.weight", state_dict)
+        self.assertNotIn("model.visual.deepstack_merger_list.0.norm.weight", state_dict)
+        self.assertTrue(
+            torch.equal(
+                state_dict["visual.deepstack_merger_list.0.norm.weight"],
+                torch.ones(4608),
+            )
+        )
+
+    def test_maps_qwen3vl_mmproj_deepstack_tensors(self):
+        mapped = self.loader.sd_map_replace(
+            {
+                "v.deepstack.0.norm.weight": torch.ones(4608),
+                "v.blk.0.attn_qkv.weight": torch.ones(3, 3),
+            },
+            self.loader.CLIP_VISION_QWEN3_MAP,
+        )
+
+        self.assertIn(
+            "model.visual.deepstack_merger_list.0.norm.weight",
+            mapped,
+        )
+        self.assertIn("model.visual.blocks.0.attn.qkv.weight", mapped)
 
 
 class Qwen3VLQuantizationTests(unittest.TestCase):

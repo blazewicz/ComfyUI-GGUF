@@ -415,6 +415,29 @@ CLIP_VISION_SD_MAP = {
     "ln2.": "norm2.",
 }
 
+CLIP_VISION_QWEN3_MAP = {
+    "v.blk": "model.visual.blocks",
+    ".fc": ".linear_fc",
+    "ck.8.": "st.0.",
+    "ck.16.": "st.1.",
+    "ck.24.": "st.2.",
+    "ck.5.": "st.0.",
+    "ck.11.": "st.1.",
+    "ck.17.": "st.2.",
+    "attn_out": "attn.proj",
+    "ln1": "norm1",
+    "ln2": "norm2",
+    "attn_qkv": "attn.qkv",
+    "ffn_up": "mlp.linear_fc1",
+    "ffn_down": "mlp.linear_fc2",
+    "mm.0": "model.visual.merger.linear_fc1",
+    "mm.2": "model.visual.merger.linear_fc2",
+    "v.post_ln": "model.visual.merger.norm",
+    "v.patch_embd": "model.visual.patch_embed.proj",
+    "v.position_embd.weight": "visual.pos_embed.weight",
+    "v.deepstack.": "model.visual.deepstack_merger_list.",
+}
+
 def sd_map_replace(raw_sd, key_map):
     sd = {}
     for k,v in raw_sd.items():
@@ -494,6 +517,9 @@ def gguf_mmproj_loader(path):
     logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
     target = os.path.join(root, target[0])
     vsd, _ = gguf_sd_loader(target, is_text_model=True)
+
+    if any("deepstack" in key for key in vsd):
+        return sd_map_replace(vsd, CLIP_VISION_QWEN3_MAP)
 
     # concat 4D to 5D
     if "v.patch_embd.weight.1" in vsd:
@@ -799,7 +825,22 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
         if arch == "qwen2vl":
             vsd = gguf_mmproj_loader(path)
             sd.update(vsd)
-        if arch == "qwen3vl" and "model.visual.deepstack_merger_list.0.norm.weight" not in sd:
+        if arch == "qwen3vl":
+            vsd = gguf_mmproj_loader(path)
+            if vsd and "model.layers.49.self_attn.q_proj.weight" in sd:
+                # MiniMax H3 receives the Qwen3-VL vision tower under
+                # ``visual.*``, unlike the standalone Qwen3-VL variants.
+                vsd = {
+                    key.replace("model.visual.", "visual.", 1)
+                    if key.startswith("model.visual.")
+                    else key: value
+                    for key, value in vsd.items()
+                }
+            sd.update(vsd)
+        if arch == "qwen3vl" and not (
+            "model.visual.deepstack_merger_list.0.norm.weight" in sd
+            or "visual.deepstack_merger_list.0.norm.weight" in sd
+        ):
             # Standard llama.cpp Qwen3-VL GGUFs omit the visual tower. Without it,
             # detect_te_model() mis-classifies the state dict as a Qwen3 LM instead
             # of Qwen3-VL. MiniMax H3 additionally uses Qwen3-VL-32B truncated to
