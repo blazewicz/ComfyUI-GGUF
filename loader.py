@@ -436,6 +436,8 @@ CLIP_VISION_QWEN3_MAP = {
     "v.patch_embd": "model.visual.patch_embed.proj",
     "v.position_embd.weight": "visual.pos_embed.weight",
     "v.deepstack.": "model.visual.deepstack_merger_list.",
+    # Older llama.cpp Qwen3-VL exporters misspelled this tensor prefix.
+    "v.deepstast.": "model.visual.deepstack_merger_list.",
 }
 
 def sd_map_replace(raw_sd, key_map):
@@ -524,7 +526,7 @@ def gguf_mmproj_loader(path):
         w2 = dequantize_tensor(vsd.pop("v.patch_embd.weight.1"), dtype=torch.float32)
         vsd["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
 
-    if any("deepstack" in key for key in vsd):
+    if any("deepstack" in key or "deepstast" in key for key in vsd):
         return sd_map_replace(vsd, CLIP_VISION_QWEN3_MAP)
 
     # run main replacement

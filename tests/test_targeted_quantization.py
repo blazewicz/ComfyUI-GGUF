@@ -933,6 +933,7 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
         mapped = self.loader.sd_map_replace(
             {
                 "v.deepstack.0.norm.weight": torch.ones(4608),
+                "v.deepstast.1.fc2.weight": torch.ones(5120, 4608),
                 "v.blk.0.attn_qkv.weight": torch.ones(3, 3),
             },
             self.loader.CLIP_VISION_QWEN3_MAP,
@@ -940,6 +941,10 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
 
         self.assertIn(
             "model.visual.deepstack_merger_list.0.norm.weight",
+            mapped,
+        )
+        self.assertIn(
+            "model.visual.deepstack_merger_list.1.linear_fc2.weight",
             mapped,
         )
         self.assertIn("model.visual.blocks.0.attn.qkv.weight", mapped)
@@ -960,7 +965,7 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
                     {
                         "v.patch_embd.weight": patch_a,
                         "v.patch_embd.weight.1": patch_b,
-                        "v.deepstack.0.norm.weight": torch.ones(8),
+                        "v.deepstast.0.norm.weight": torch.ones(8),
                     },
                     {},
                 ),
