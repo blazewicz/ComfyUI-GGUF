@@ -54,9 +54,18 @@ Initial support for quantizing T5 has also been added recently, these can be use
 - [t5_v1.1-xxl GGUF](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
 - [Qwen3-VL-4B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF) 🍴
 - [Qwen3-VL-32B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-VL-32B-Instruct-GGUF) 🍴
+- [Qwen3-VL-32B-Instruct-MiniMax-H3 pruned GGUFs](https://huggingface.co/nif0/Qwen3-VL-32B-Instruct-MiniMax-H3-GGUF) 🍴
 - [Gemma 4 GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF) text encoders (E2B, E4B, 12B, and 31B) with ComfyUI v0.30.0 or later. Gemma 4 GGUFs must include the standard `tokenizer.ggml.tokens`, `tokenizer.ggml.merges`, and `tokenizer.ggml.token_type` metadata. 🍴
 
 See the instructions in the [tools](https://github.com/city96/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants.
+
+### Qwen3-VL-32B MiniMax H3 text encoders
+
+Pruned Qwen3-VL-32B GGUFs, including IQ2/IQ3 variants, are loaded with
+**CLIPLoader (GGUF)**. Put the file in `ComfyUI/models/text_encoders` (or
+`ComfyUI/models/clip`) and select the `MINIMAX` CLIP type. This requires a
+ComfyUI build containing MiniMax H3 support
+(`57500fc5bc92566a63f2046824f522cd55c335ca` or newer).
 
 ## Converting Krea 2, Ideogram 4, MiniMax H3, and MiniMax Music 3 models
 

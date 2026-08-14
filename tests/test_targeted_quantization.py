@@ -30,7 +30,7 @@ from tools.convert import (
     quantize_int8_convrot,
     resolve_quantization_device,
 )
-from dequant import dequantize_tensor
+from dequant import dequantize, dequantize_functions, dequantize_tensor
 from lora import (
     fuse_targets_into_state_dict,
     load_gguf_lora,
@@ -876,6 +876,42 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
             state_dict["model.visual.merger.linear_fc2.weight"].shape,
             (4096, 4608),
         )
+
+    def test_pruned_32b_clip_loader_injects_marker(self):
+        with mock.patch.object(
+            self.loader,
+            "gguf_sd_loader",
+            return_value=(
+                {
+                    "model.layers.0.input_layernorm.weight": torch.zeros(5120),
+                    "model.layers.49.self_attn.q_proj.weight": torch.zeros(1),
+                },
+                {"arch_str": "qwen3vl"},
+            ),
+        ):
+            state_dict = self.loader.gguf_clip_loader("qwen3-vl-pruned.gguf")
+
+        self.assertEqual(
+            state_dict["visual.deepstack_merger_list.0.norm.weight"].shape,
+            (4608,),
+        )
+
+
+class Qwen3VLQuantizationTests(unittest.TestCase):
+    def test_supports_quant_types_used_by_pruned_32b_gguf(self):
+        for quant_name in ("IQ3_S", "IQ3_XXS", "IQ2_S", "IQ2_XS"):
+            quant_type = getattr(gguf.GGMLQuantizationType, quant_name)
+            _, type_size = gguf.GGML_QUANT_SIZES[quant_type]
+            output = dequantize(
+                torch.zeros((1, type_size), dtype=torch.uint8),
+                quant_type,
+                (256,),
+                dtype=torch.float32,
+            )
+
+            self.assertEqual(output.shape, (256,))
+            self.assertEqual(output.dtype, torch.float32)
+            self.assertIn(quant_type, dequantize_functions)
 
 
 class Gemma4GGUFLoaderTests(unittest.TestCase):
