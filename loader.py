@@ -518,14 +518,14 @@ def gguf_mmproj_loader(path):
     target = os.path.join(root, target[0])
     vsd, _ = gguf_sd_loader(target, is_text_model=True)
 
-    if any("deepstack" in key for key in vsd):
-        return sd_map_replace(vsd, CLIP_VISION_QWEN3_MAP)
-
     # concat 4D to 5D
     if "v.patch_embd.weight.1" in vsd:
         w1 = dequantize_tensor(vsd.pop("v.patch_embd.weight"), dtype=torch.float32)
         w2 = dequantize_tensor(vsd.pop("v.patch_embd.weight.1"), dtype=torch.float32)
         vsd["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
+
+    if any("deepstack" in key for key in vsd):
+        return sd_map_replace(vsd, CLIP_VISION_QWEN3_MAP)
 
     # run main replacement
     vsd = sd_map_replace(vsd, CLIP_VISION_SD_MAP)

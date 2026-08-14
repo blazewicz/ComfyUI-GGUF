@@ -944,6 +944,34 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
         )
         self.assertIn("model.visual.blocks.0.attn.qkv.weight", mapped)
 
+    def test_qwen3vl_mmproj_stacks_temporal_patch_embeddings(self):
+        with TemporaryDirectory() as temp_dir:
+            text_encoder = Path(temp_dir) / "qwen3-vl-IQ3_XXS.gguf"
+            mmproj = Path(temp_dir) / "qwen3-vl-mmproj-BF16.gguf"
+            text_encoder.touch()
+            mmproj.touch()
+            patch_a = torch.ones((2, 3, 2, 2))
+            patch_b = torch.full((2, 3, 2, 2), 2.0)
+
+            with mock.patch.object(
+                self.loader,
+                "gguf_sd_loader",
+                return_value=(
+                    {
+                        "v.patch_embd.weight": patch_a,
+                        "v.patch_embd.weight.1": patch_b,
+                        "v.deepstack.0.norm.weight": torch.ones(8),
+                    },
+                    {},
+                ),
+            ):
+                mapped = self.loader.gguf_mmproj_loader(str(text_encoder))
+
+        weight = mapped["model.visual.patch_embed.proj.weight"]
+        self.assertEqual(weight.shape, (2, 3, 2, 2, 2))
+        self.assertTrue(torch.equal(weight[:, :, 0], patch_a))
+        self.assertTrue(torch.equal(weight[:, :, 1], patch_b))
+
 
 class Qwen3VLQuantizationTests(unittest.TestCase):
     def test_supports_quant_types_used_by_pruned_32b_gguf(self):
